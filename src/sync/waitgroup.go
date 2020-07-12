@@ -30,11 +30,23 @@ type WaitGroup struct {
 
 // state returns pointers to the state and sema fields stored within wg.state1.
 func (wg *WaitGroup) state() (statep *uint64, semap *uint32) {
+	// 判断是否是8字节对齐
 	if uintptr(unsafe.Pointer(&wg.state1))%8 == 0 {
+		// 8字节对齐，前8个字节存state，后4个字节存sema
 		return (*uint64)(unsafe.Pointer(&wg.state1)), &wg.state1[2]
 	} else {
+		// 4字节对齐：后8字节作为state，前4个字节存sema
 		return (*uint64)(unsafe.Pointer(&wg.state1[1])), &wg.state1[0]
 	}
+	// 这样做的目的是，保证原子操作的state1在32位系统上，也是8字节对齐
+	// 之所以要强制8字节对齐，是因为在 32bit 平台下进行 64bit 原子操作要求必须 8 字节对齐，否则程序会 panic。
+	/*
+	Bugs
+	On x86-32, the 64-bit functions use instructions unavailable before the Pentium MMX.
+	On non-Linux ARM, the 64-bit functions use instructions unavailable before the ARMv6k core.
+	On ARM, x86-32, and 32-bit MIPS, it is the caller’s responsibility to arrange for 64-bit alignment of 64-bit words accessed atomically.
+	The first word in a variable or in an allocated struct, array, or slice can be relied upon to be 64-bit aligned.
+	*/
 }
 
 // Add adds delta, which may be negative, to the WaitGroup counter.
