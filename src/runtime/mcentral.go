@@ -20,12 +20,16 @@ import "runtime/internal/atomic"
 //
 //go:notinheap
 type mcentral struct {
+	// 互斥锁
 	lock      mutex
+	// 规格
 	spanclass spanClass
 
 	// For !go115NewMCentralImpl.
 	// 该结构体在初始化时，两个链表都不包含任何内存，程序运行时会扩容结构体持有的两个链表，nmalloc 字段也记录了该结构体中分配的对象个数。
+	// 尚有空闲object的mspan链表
 	nonempty mSpanList // list of spans with a free object, ie a nonempty free list       // 实际上是 有空闲对象的 span 链表
+	// 没有空闲object的mspan链表，或者是已被mcache取走的msapn链表
 	empty    mSpanList // list of spans with no free objects (or cached in an mcache)     // 实际上是 没有空闲对象或 span 已经被 mcache 缓存的 span 链表。
 
 	// partial and full contain two mspan sets: one of swept in-use
@@ -52,6 +56,7 @@ type mcentral struct {
 	// nmalloc is the cumulative count of objects allocated from
 	// this mcentral, assuming all spans in mcaches are
 	// fully-allocated. Written atomically, read under STW.
+	// 已累计分配的对象个数
 	nmalloc uint64                                // 已分配对象的累计计数器
 }
 

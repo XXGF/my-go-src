@@ -407,7 +407,9 @@ type mspan struct {
 	prev *mspan     // previous span in list, or nil if none                 // 链表中的前一个 span，如果为空则为 nil
 	list *mSpanList // For debugging. TODO: Remove.
 
+	// 起始地址，也即所管理页的地址
 	startAddr uintptr // address of first byte of span aka s.base()          // span 的第一个字节的地址，即 s.base()，即它管理的内存页的起始地址
+	// 管理的页数
 	npages    uintptr // number of pages in span                             // 一个 span 中的 page 数量
 
 	manualFreeList gclinkptr // list of free objects in mSpanManual spans    // mSpanManual span 的释放对象链表
@@ -430,6 +432,7 @@ type mspan struct {
 	freeindex uintptr                                                    //  扫描页中空闲对象的初始索引
 	// TODO: Look up nelems from sizeclass and remove this field if it
 	// helps performance.
+	// 块个数，表示有多少个块可供分配
 	nelems uintptr // number of object in the span.                     // span中的object的数量
 
 	// Cache of the allocBits at freeindex. allocCache is shifted
@@ -462,6 +465,7 @@ type mspan struct {
 	// The sweep will free the old allocBits and set allocBits to the
 	// gcmarkBits. The gcmarkBits are replaced with a fresh zeroed
 	// out memory.
+	// 分配位图，每一位代表一个块是否已经分配
 	allocBits  *gcBits             // 用于标记内存的占用情况
 	gcmarkBits *gcBits             // 用户标记内存的回收情况
 
@@ -476,12 +480,15 @@ type mspan struct {
 	sweepgen    uint32
 	divMul      uint16        // for divide by elemsize - divMagic.mul
 	baseMask    uint16        // if non-0, elemsize is a power of 2, & this will get object allocation base
+	// 已分配块的个数
 	allocCount  uint16        // number of allocated objects                           // 分配的对象数量
+	// class表中的class ID，和Size Classs相关
 	spanclass   spanClass     // size class and noscan (uint8)                         // 对象大小等级和是否需要被gc扫描
 	state       mSpanStateBox // mSpanInUse etc; accessed atomically (get/set methods)
 	needzero    uint8         // needs to be zeroed before allocation
 	divShift    uint8         // for divide by elemsize - divMagic.shift
 	divShift2   uint8         // for divide by elemsize - divMagic.shift2
+	// class表中的对象大小，也即块大小
 	elemsize    uintptr       // computed from sizeclass or from npages
 	limit       uintptr       // end of data in span
 	speciallock mutex         // guards specials list

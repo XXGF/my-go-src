@@ -567,6 +567,9 @@ type m struct {
 }
 
 // GMP中的管理groutine本地队列的上下文
+// mcache 会被 P 持有，当 M 和 P 绑定时，M 同样会保留 mcache 的指针
+// mcache 直接向操作系统申请内存，且常驻运行时
+// P 通过 make 命令进行分配，会分配在 Go 堆上
 type p struct {
 	id          int32
 	status      uint32 // one of pidle/prunning/...
@@ -575,7 +578,9 @@ type p struct {
 	syscalltick uint32     // incremented on every system call
 	sysmontick  sysmontick // last tick observed by sysmon
 	m           muintptr   // back-link to associated m (nil if idle)
-	mcache      *mcache
+	// 当调用 runtime.procresize 时，初始化新的 P 时，mcache 是直接分配到 p 的； 回收 p 时，mcache 是直接从 p 上获取
+	// 所以可以得出结论：mcache是跟着P跑的
+	mcache      *mcache    // 每个P都有一个mcache
 	pcache      pageCache
 	raceprocctx uintptr
 
