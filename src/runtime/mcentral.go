@@ -16,14 +16,17 @@ import "runtime/internal/atomic"
 
 // Central list of free objects of a given size.
 //
+// 是内存分配器的中心缓存，与线程缓存不同，访问中心缓存中的内存管理单元需要使用互斥锁：
+//
 //go:notinheap
 type mcentral struct {
 	lock      mutex
 	spanclass spanClass
 
 	// For !go115NewMCentralImpl.
-	nonempty mSpanList // list of spans with a free object, ie a nonempty free list
-	empty    mSpanList // list of spans with no free objects (or cached in an mcache)
+	// 该结构体在初始化时，两个链表都不包含任何内存，程序运行时会扩容结构体持有的两个链表，nmalloc 字段也记录了该结构体中分配的对象个数。
+	nonempty mSpanList // list of spans with a free object, ie a nonempty free list       // 实际上是 有空闲对象的 span 链表
+	empty    mSpanList // list of spans with no free objects (or cached in an mcache)     // 实际上是 没有空闲对象或 span 已经被 mcache 缓存的 span 链表。
 
 	// partial and full contain two mspan sets: one of swept in-use
 	// spans, and one of unswept in-use spans. These two trade
@@ -49,7 +52,7 @@ type mcentral struct {
 	// nmalloc is the cumulative count of objects allocated from
 	// this mcentral, assuming all spans in mcaches are
 	// fully-allocated. Written atomically, read under STW.
-	nmalloc uint64
+	nmalloc uint64                                // 已分配对象的累计计数器
 }
 
 // Initialize a single central free list.
@@ -92,6 +95,11 @@ func (c *mcentral) fullSwept(sweepgen uint32) *spanSet {
 }
 
 // Allocate a span to use in an mcache.
+// 这个方法主要设计一下几点
+// 1.从有空闲对象的mspan链表【nonempty】中查找可以使用的内存管理单元
+// 2.从没有空闲对象的mspan链表【empty】中查找可以使用的内存管理单元
+// 3.调用 runtime.mcentral.grow 从堆中申请新的内存管理单元
+// 4.更新内存管理单元的allocCache等字段，帮助快速分配内存
 func (c *mcentral) cacheSpan() *mspan {
 	if !go115NewMCentralImpl {
 		return c.oldCacheSpan()
@@ -229,8 +237,10 @@ func (c *mcentral) oldCacheSpan() *mspan {
 	sg := mheap_.sweepgen
 retry:
 	var s *mspan
+	// 1.从有空闲对象的mspan链表【nonempty】中查找可以使用的内存管理单元
 	for s = c.nonempty.first; s != nil; s = s.next {
 		if s.sweepgen == sg-2 && atomic.Cas(&s.sweepgen, sg-2, sg-1) {
+			// 1.当mspan等待被回收，将其插入empty链表，调用runtime.mspan.sweep 清理改mspan，并返回
 			c.nonempty.remove(s)
 			c.empty.insertBack(s)
 			unlock(&c.lock)
@@ -238,16 +248,22 @@ retry:
 			goto havespan
 		}
 		if s.sweepgen == sg-1 {
+			// 2.当mspan正在被后台回收，则跳过该单元
 			// the span is being swept by background sweeper, skip
 			continue
 		}
 		// we have a nonempty span that does not require sweeping, allocate from it
+		// 3.当mspan已经被回收时，将内存单元插入 empty 链表并返回
 		c.nonempty.remove(s)
 		c.empty.insertBack(s)
 		unlock(&c.lock)
 		goto havespan
 	}
 
+	// 如果中心缓存没有在 nonempty 中找到可用的内存管理单元，就会继续遍历其持有的 empty 链表，
+	//我们在这里的处理与包含空闲对象的链表几乎完全相同。
+	//当找到需要回收的内存单元时，我们也会触发 runtime.mspan.sweep 进行清理，
+	//如果清理后的内存单元仍然不包含空闲对象，就会重新执行相应的
 	for s = c.empty.first; s != nil; s = s.next {
 		if s.sweepgen == sg-2 && atomic.Cas(&s.sweepgen, sg-2, sg-1) {
 			// we have an empty span that requires sweeping,
@@ -282,6 +298,8 @@ retry:
 	unlock(&c.lock)
 
 	// Replenish central list if empty.
+	// 如果 runtime.mcentral 在两个链表中都没有找到可用的内存单元，
+	// 它会调用 runtime.mcentral.grow 触发扩容操作从堆中申请新的内存：
 	s = c.grow()
 	if s == nil {
 		return nil
@@ -499,8 +517,12 @@ func (c *mcentral) freeSpan(s *mspan, preserve bool, wasempty bool) bool {
 }
 
 // grow allocates a new empty span from the heap and initializes it for c's size class.
+// 中心缓存的扩容方法 runtime.mcentral.grow 会根据预先计算的 class_to_allocnpages 和 class_to_size，
+// 获取待分配的页数以及跨度类并调用 runtime.mheap.alloc 获取新的
 func (c *mcentral) grow() *mspan {
+	// 取改span-class对应的页数
 	npages := uintptr(class_to_allocnpages[c.spanclass.sizeclass()])
+	// 取span-class
 	size := uintptr(class_to_size[c.spanclass.sizeclass()])
 
 	s := mheap_.alloc(npages, c.spanclass, true)
@@ -509,6 +531,7 @@ func (c *mcentral) grow() *mspan {
 	}
 
 	// Use division by multiplication and shifts to quickly compute:
+	// 使用除法和移位除法可快速计算：
 	// n := (npages << _PageShift) / size
 	n := (npages << _PageShift) >> s.divShift * uintptr(s.divMul) >> s.divShift2
 	s.limit = s.base() + size*n

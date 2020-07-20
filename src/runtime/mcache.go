@@ -15,11 +15,18 @@ import (
 // mcaches are allocated from non-GC'd memory, so any heap pointers
 // must be specially handled.
 //
+// 是一个 per-P 的缓存，它是一个包含不同大小等级的 span 链表的数组，
+// 其中 mcache.alloc 的每一个数组元素 都是某一个特定大小的 mspan 的链表头指针。
+
+// 1.mcache 会被 P 持有，当 M 和 P 绑定时，M 同样会保留 mcache 的指针
+// 2.mcache 直接向操作系统申请内存，且常驻运行时
+// 3.P通过make命令进行分配，会分配在Go堆上
 //go:notinheap
 type mcache struct {
 	// The following members are accessed on every malloc,
 	// so they are grouped here for better caching.
 	next_sample uintptr // trigger heap sample after allocating this many bytes
+	// 分配的可扫描的字节数
 	local_scan  uintptr // bytes of scannable heap allocated
 
 	// Allocator cache for tiny objects w/o pointers.
@@ -31,17 +38,26 @@ type mcache struct {
 	// tiny is a heap pointer. Since mcache is in non-GC'd memory,
 	// we handle it by clearing it in releaseAll during mark
 	// termination.
+
+	// tiny 指向当前 tiny 块的起始位置，或当没有 tiny 块时候为 nil
+	// tiny 是一个堆指针。由于mcache在非GC内存中，我们通弄过在 mark termination 期间，在releaseAll 中清楚它来处理它
 	tiny             uintptr
+	// 下一个空闲内存所在的偏移量
 	tinyoffset       uintptr
-	local_tinyallocs uintptr // number of tiny allocs not counted in other stats
+	// 记录内存分配器中分配的对象个数。
+	local_tinyallocs uintptr     // number of tiny allocs not counted in other stats
+
+	// 以上字段会在每次alloc时，都被访问
 
 	// The rest is not accessed on every malloc.
 
-	alloc [numSpanClasses]*mspan // spans to allocate from, indexed by spanClass
+	// 每一个线程缓存都持有 67 * 2 个 runtime.mspan，这些内存管理单元都存储在结构体的 alloc 字段中：
+	alloc [numSpanClasses]*mspan // spans to allocate from, indexed by spanClass  // 用来分配的 spans，由 spanClass 索引
 
 	stackcache [_NumStackOrders]stackfreelist
 
 	// Local allocator stats, flushed during GC.
+	// 本地分配器统计，在 GC 期间被刷新
 	local_largefree  uintptr                  // bytes freed for large objects (>maxsmallsize)
 	local_nlargefree uintptr                  // number of frees for large objects (>maxsmallsize)
 	local_nsmallfree [_NumSizeClasses]uintptr // number of frees for small objects (<=maxsmallsize)
@@ -80,26 +96,37 @@ type stackfreelist struct {
 }
 
 // dummy mspan that contains no free objects.
+// 虚拟的MSpan，不包含任何对象。
 var emptymspan mspan
 
+// 运行时在初始化处理器时【即mallocinit】，会调用 runtime.allocmcache 初始化线程缓存，
+// 该函数会在系统栈中使用 runtime.mheap 中的线程缓存分配器初始化新的 runtime.mcache 结构体：
 func allocmcache() *mcache {
 	var c *mcache
 	systemstack(func() {
 		lock(&mheap_.lock)
+		// 从 mheap 上分配一个 mcache。 由于 mheap 是全局的，因此在分配期必须对其进行加锁。
+		// 使用 fixalloc组件 来完成分配
 		c = (*mcache)(mheap_.cachealloc.alloc())
 		c.flushGen = mheap_.sweepgen
 		unlock(&mheap_.lock)
 	})
+	// c.alloc 存放的是 *mspan
 	for i := range c.alloc {
+		// 初始化后的runtime.mcache中的所有runtime.mspan都是空的占位符
 		c.alloc[i] = &emptymspan
 	}
+	// 返回下一个采样点，是服从泊松过程的随机数
 	c.next_sample = nextSample()
 	return c
 }
 
+// 释放mcache
 func freemcache(c *mcache) {
 	systemstack(func() {
+		// 归还mspan
 		c.releaseAll()
+		// 释放stack
 		stackcache_clear(c)
 
 		// NOTE(rsc,rlh): If gcworkbuffree comes back, we need to coordinate
@@ -108,7 +135,9 @@ func freemcache(c *mcache) {
 		// gcworkbuffree(c.gcworkbuf)
 
 		lock(&mheap_.lock)
+		// 记录局部统计
 		purgecachedstats(c)
+		// 将mcache释放
 		mheap_.cachealloc.free(unsafe.Pointer(c))
 		unlock(&mheap_.lock)
 	})
@@ -139,6 +168,9 @@ func (c *mcache) refill(spc spanClass) {
 	}
 
 	// Get a new cached span from the central lists.
+	// 该函数会从中心缓存中申请新的 runtime.mspan 存储到线程缓存中，
+	// 这也是向线程缓存中插入内存管理单元的唯一方法。
+	// 线程缓存【即mcacne】会通过 runtime.mcentral.cacheSpan 方法获取新的内存管理单元
 	s = mheap_.central[spc].mcentral.cacheSpan()
 	if s == nil {
 		throw("out of memory")
@@ -155,15 +187,19 @@ func (c *mcache) refill(spc spanClass) {
 	c.alloc[spc] = s
 }
 
+// 由于mcache从非GC内存上进行分配，因此出现的任何对指针，都必须进行特殊处理。
+// 所以在释放前，需要调用mcache.releaseAll将堆指针进行处理：
 func (c *mcache) releaseAll() {
 	for i := range c.alloc {
 		s := c.alloc[i]
 		if s != &emptymspan {
+			// 将mspan归还
 			mheap_.central[i].mcentral.uncacheSpan(s)
 			c.alloc[i] = &emptymspan
 		}
 	}
 	// Clear tinyalloc pool.
+	// 清空tinyalloc池
 	c.tiny = 0
 	c.tinyoffset = 0
 }

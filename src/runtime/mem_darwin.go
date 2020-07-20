@@ -8,6 +8,7 @@ import (
 	"unsafe"
 )
 
+// 这里不进行堆栈溢出检查，目的应该是为了为栈分配更多的内存？
 // Don't split the stack as this function may be invoked without a valid G,
 // which prevents us from allocating more stack.
 //go:nosplit

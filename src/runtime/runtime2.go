@@ -323,8 +323,8 @@ type gobuf struct {
 	// and restores it doesn't need write barriers. It's still
 	// typed as a pointer so that any other writes from Go get
 	// write barriers.
-	sp   uintptr
-	pc   uintptr
+	sp   uintptr  // 栈指针位置
+	pc   uintptr  // 运行到的程序位置
 	g    guintptr
 	ctxt unsafe.Pointer
 	ret  sys.Uintreg
@@ -393,8 +393,8 @@ type wincallbackcontext struct {
 // The bounds of the stack are exactly [lo, hi),
 // with no implicit data structures on either side.
 type stack struct {
-	lo uintptr
-	hi uintptr
+	lo uintptr // 该协程拥有的栈地位
+	hi uintptr // 该协程拥有的栈高位
 }
 
 // heldLockInfo gives info on a held lock and the rank of that lock
@@ -402,7 +402,10 @@ type heldLockInfo struct {
 	lockAddr uintptr
 	rank     lockRank
 }
-
+// go func() {}() 做了什么：
+// 1.new 一个 go的结构体，并把func的地址传到startfunc
+// 2.把 func的参数拷贝到栈里面
+// 3.把 创建的go结构体放入调度队列，等待调度
 type g struct {
 	// Stack parameters.
 	// stack describes the actual stack memory: [stack.lo, stack.hi).
@@ -411,21 +414,21 @@ type g struct {
 	// stackguard1 is the stack pointer compared in the C stack growth prologue.
 	// It is stack.lo+StackGuard on g0 and gsignal stacks.
 	// It is ~0 on other goroutine stacks, to trigger a call to morestackc (and crash).
-	stack       stack   // offset known to runtime/cgo
+	stack       stack   // offset known to runtime/cgo    // go的协程实现是有栈协程，所以它有自己的栈
 	stackguard0 uintptr // offset known to liblink
 	stackguard1 uintptr // offset known to liblink
 
 	_panic       *_panic // innermost panic - offset known to liblink
 	_defer       *_defer // innermost defer
 	m            *m      // current m; offset known to arm liblink
-	sched        gobuf
+	sched        gobuf   // 协程切换时保存的上下文信息
 	syscallsp    uintptr        // if status==Gsyscall, syscallsp = sched.sp to use during gc
 	syscallpc    uintptr        // if status==Gsyscall, syscallpc = sched.pc to use during gc
 	stktopsp     uintptr        // expected sp at top of stack, to check in traceback
 	param        unsafe.Pointer // passed parameter on wakeup
 	atomicstatus uint32
 	stackLock    uint32 // sigprof/scang lock; TODO: fold in to atomicstatus
-	goid         int64
+	goid         int64    // 协程id
 	schedlink    guintptr
 	waitsince    int64      // approx time when the g become blocked
 	waitreason   waitReason // if status==Gwaiting
@@ -563,6 +566,7 @@ type m struct {
 	locksHeld    [10]heldLockInfo
 }
 
+// GMP中的管理groutine本地队列的上下文
 type p struct {
 	id          int32
 	status      uint32 // one of pidle/prunning/...
@@ -634,7 +638,7 @@ type p struct {
 	// The when field of the first entry on the timer heap.
 	// This is updated using atomic functions.
 	// This is 0 if the timer heap is empty.
-	timer0When uint64
+	timer0When uint64  // 记录计时器运行时长，需要保证32位系统上也是8byte对齐（原子操作）
 
 	// Per-P GC state
 	gcAssistTime         int64    // Nanoseconds in assistAlloc

@@ -4155,6 +4155,7 @@ func (pp *p) init(id int32) {
 		pp.deferpool[i] = pp.deferpoolbuf[i][:0]
 	}
 	pp.wbBuf.reset()
+	// 为P分配mcache
 	if pp.mcache == nil {
 		if id == 0 {
 			if mcache0 == nil {
@@ -4164,6 +4165,7 @@ func (pp *p) init(id int32) {
 			// mcache0: the one with ID 0.
 			pp.mcache = mcache0
 		} else {
+			// 创建 cache
 			pp.mcache = allocmcache()
 		}
 	}
@@ -4312,6 +4314,7 @@ func procresize(nprocs int32) *p {
 	}
 
 	// initialize new P's
+	// 初始化新的P
 	for i := old; i < nprocs; i++ {
 		pp := allp[i]
 		if pp == nil {

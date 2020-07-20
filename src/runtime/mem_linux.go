@@ -14,6 +14,19 @@ const (
 	_EINVAL = 22
 )
 
+// 概述：
+// 系统级的内存管理调用是平台相关的，这里以 Linux 为例，
+
+// 运行时的 sysAlloc、sysUnused、sysUsed、sysFree、sysReserve、sysMap 和 sysFault 都是系统级的调用。
+
+// 其中 sysAlloc、sysReserve 和 sysMap 都是向操作系统申请内存的操作，他们均涉及关于内存分配的系统调用就是 mmap，
+//区别在于：
+//sysAlloc 是从操作系统上申请清零后的内存，调用参数是 _PROT_READ|_PROT_WRITE, _MAP_ANON|_MAP_PRIVATE；
+//sysReserve 是从操作系统中保留内存的地址空间，并未直接分配内存，调用参数是 _PROT_NONE, _MAP_ANON|_MAP_PRIVATE，；
+//sysMap 则是用于通知操作系统使用先前已经保留好的空间，参数是 _PROT_READ|_PROT_WRITE, _MAP_ANON|_MAP_FIXED|_MAP_PRIVATE。
+
+// 不过 sysAlloc 和 sysReserve 都是操作系统对齐的内存，但堆分配器可能使用更大的对齐方式，因此这部分获得的内存都需要额外进行一些重排的工作。
+
 // Don't split the stack as this method may be invoked without a valid G, which
 // prevents us from allocating more stack.
 //go:nosplit
@@ -172,3 +185,14 @@ func sysMap(v unsafe.Pointer, n uintptr, sysStat *uint64) {
 		throw("runtime: cannot map pages in arena address space")
 	}
 }
+
+// 总结：
+// 最后我们来理一下这些系统级调用的关系：
+//
+//当开始保留内存地址时，调用 sysReserve；
+//当需要使用或不使用保留的内存区域时，通知操作系统，调用 sysUnused、sysUsed；
+
+//正式使用保留的地址，使用 sysMap；
+//释放时使用 sysFree 以及调试时使用 sysFault；
+
+//非用户态的调试、“堆外内存“ 则使用 sysAlloc 直接向操作系统获得清零的内存。

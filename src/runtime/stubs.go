@@ -73,7 +73,15 @@ func badsystemstack() {
 // *ptr is uninitialized memory (e.g., memory that's being reused
 // for a new allocation) and hence contains only "junk".
 //
+// 这个方法是用来清除内存的数据的
 // The (CPU-specific) implementations of this function are in memclr_*.s.
+
+// memclrNoHeapPointers 清除从 ptr 开始的 n 个字节
+// 通常情况下你应该使用 typedmemclr，而 memclrNoHeapPointers 应该仅在调用方知道 *ptr 不包含堆指针的情况下使用
+// 因为 *ptr 只能是下面两种情况：
+// 1. *ptr 是初始化过的内存，且其类型不是指针。
+// 2. *ptr 是未初始化的内存（例如刚被新分配时使用的内存），则只包含 "junk" 垃圾内存
+// 见 memclr_*.s 清理过程是汇编实现的，就是一些内存的归零工作
 //go:noescape
 func memclrNoHeapPointers(ptr unsafe.Pointer, n uintptr)
 

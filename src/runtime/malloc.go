@@ -414,6 +414,7 @@ var (
 // marks a region such that it will always fault if accessed. Used only for
 // debugging the runtime.
 
+// 内存分配器初始化
 func mallocinit() {
 	if class_to_size[_TinySizeClass] != _TinySize {
 		throw("bad TinySizeClass")
@@ -477,14 +478,19 @@ func mallocinit() {
 	}
 
 	// Initialize the heap.
+	// 初始化堆
 	mheap_.init()
+	// 还包含对 mcache 初始化 allocmcache()，
+	// 这个 mcache 会在 procresize 中将 mcache 转移到 P 的门下，而并非属于 M
 	mcache0 = allocmcache()
 	lockInit(&gcBitsArenas.lock, lockRankGcBitsArenas)
 	lockInit(&proflock, lockRankProf)
 	lockInit(&globalAlloc.mutex, lockRankGlobalAlloc)
 
 	// Create initial arena growth hints.
+	// 创建初始的arena增长hint
 	if sys.PtrSize == 8 {
+		// 64位机器
 		// On a 64-bit machine, we pick the following hints
 		// because:
 		//
@@ -548,6 +554,7 @@ func mallocinit() {
 			hint.next, mheap_.arenaHints = mheap_.arenaHints, hint
 		}
 	} else {
+		// 32位机器
 		// On a 32-bit machine, we're much more concerned
 		// about keeping the usable heap contiguous.
 		// Hence:
@@ -626,18 +633,28 @@ func mallocinit() {
 // be transitioned to Ready before use.
 //
 // h must be locked.
+// 在页堆扩容的过程中，runtime.mheap.sysAlloc 是页堆用来申请 "虚拟内存" 的方法，我们会分几部分介绍该方法的实现。
+// 1.首先会通过现有的 arena 获得已经保留的内存区域，如果能获取到，则直接对 arena 进行初始化
+// 2.如果没有，则会通过 sysReserve 为 arena 保留新的内存区域，并通过 sysReserveAligned 对操作系统对齐的区域进行重排，而后使用 sysMap 正式使用所在区块的内存。
+// 3.在 arena 初始化阶段，本质上是为 arena 创建 metadata，这部分内存属于 “堆外内存“，即不会被 GC 所追踪的内存，因而通过 persistentalloc 进行分配。
+// persistentalloc 是 sysAlloc 之上的一层封装，它分配到的内存不能被释放。
 func (h *mheap) sysAlloc(n uintptr) (v unsafe.Pointer, size uintptr) {
 	n = alignUp(n, heapArenaBytes)
 
 	// First, try the arena pre-reservation.
+	// 首先，该方法会尝试在预保留的区域申请内存：
 	v = h.arena.alloc(n, heapArenaBytes, &memstats.heap_sys)
 	if v != nil {
 		size = n
 		goto mapped
 	}
+	// 上述代码会调用线性分配器的 runtime.linearAlloc.alloc 方法在预先保留的内存中申请一块可以使用的空间。
+	// 如果没有可用的空间，我们会根据页堆的 arenaHints 在目标地址上尝试扩容：
 
 	// Try to grow the heap at a hint address.
+	// 如果获取不到，再尝试增长arena hint
 	for h.arenaHints != nil {
+		// runtime.sysReserve 和 runtime.sysMap 是上述代码的核心部分，它们会从操作系统中申请内存并将内存转换至 Prepared 状态。
 		hint := h.arenaHints
 		p := hint.addr
 		if hint.down {
@@ -668,6 +685,7 @@ func (h *mheap) sysAlloc(n uintptr) (v unsafe.Pointer, size uintptr) {
 		// particular, this is already how Windows behaves, so
 		// it would simplify things there.
 		if v != nil {
+			// 失败，丢弃并重新尝试
 			sysFree(v, n, nil)
 		}
 		h.arenaHints = hint.next
@@ -692,6 +710,7 @@ func (h *mheap) sysAlloc(n uintptr) (v unsafe.Pointer, size uintptr) {
 		}
 
 		// Create new hints for extending this region.
+		// 创建新的hint来增长此区域
 		hint := (*arenaHint)(h.arenaHintAlloc.alloc())
 		hint.addr, hint.down = uintptr(v), true
 		hint.next, mheap_.arenaHints = mheap_.arenaHints, hint
@@ -701,6 +720,7 @@ func (h *mheap) sysAlloc(n uintptr) (v unsafe.Pointer, size uintptr) {
 	}
 
 	// Check for bad pointers or pointers we can't use.
+	// 检查不能使用的指针
 	{
 		var bad string
 		p := uintptr(v)
@@ -724,10 +744,12 @@ func (h *mheap) sysAlloc(n uintptr) (v unsafe.Pointer, size uintptr) {
 	}
 
 	// Transition from Reserved to Prepared.
+	// 正式开始使用保留的内存
 	sysMap(v, size, &memstats.heap_sys)
 
 mapped:
 	// Create arena metadata.
+	// runtime.mheap.sysAlloc 方法在最后会初始化一个新的 runtime.heapArena 结构体来管理刚刚申请的内存空间，该结构体会被加入页堆的二维矩阵中。
 	for ri := arenaIndex(uintptr(v)); ri <= arenaIndex(uintptr(v)+size-1); ri++ {
 		l2 := h.arenas[ri.l1()]
 		if l2 == nil {
@@ -752,6 +774,7 @@ mapped:
 		}
 
 		// Add the arena to the arenas list.
+		// 将 arena 添加到 arena 列表中
 		if len(h.allArenas) == cap(h.allArenas) {
 			size := 2 * uintptr(cap(h.allArenas)) * sys.PtrSize
 			if size == 0 {
@@ -840,6 +863,9 @@ var zerobase uintptr
 
 // nextFreeFast returns the next free object if one is quickly available.
 // Otherwise it returns 0.
+// allocCache 字段用于计算 freeindex 上的 allocBits 缓存，
+// allocCache 进行了移位使其最低位对应于 freeindex 位。
+// allocCache 保存 allocBits 的补码，从而尾零计数可以直接使用它。
 func nextFreeFast(s *mspan) gclinkptr {
 	theBit := sys.Ctz64(s.allocCache) // Is there a free object in the allocCache?
 	if theBit < 64 {
@@ -867,20 +893,27 @@ func nextFreeFast(s *mspan) gclinkptr {
 //
 // Must run in a non-preemptible context since otherwise the owner of
 // c could change.
+// 先尝试获取 freeIndex，
+// 如已经获取到，则直接根据元素的大小来计算需要被 GC 的内存位置。
+// 当 span 已满时候，会通过 refill 进行填充，而后再次尝试获取 freeIndex。
+// 可以看到 refill 其实是从 mcentral 调用 cacheSpan 方法来获得 span
 func (c *mcache) nextFree(spc spanClass) (v gclinkptr, s *mspan, shouldhelpgc bool) {
 	s = c.alloc[spc]
 	shouldhelpgc = false
+	// 获得 s.freeindex 中或之后 s 中下一个空闲对象的索引
 	freeIndex := s.nextFreeIndex()
 	if freeIndex == s.nelems {
 		// The span is full.
+		// span已满
 		if uintptr(s.allocCount) != s.nelems {
 			println("runtime: s.allocCount=", s.allocCount, "s.nelems=", s.nelems)
 			throw("s.allocCount != s.nelems && freeIndex == s.nelems")
 		}
+		// 调用refill从中心缓存获取新的mspan，替换mcache中已有的mspan
 		c.refill(spc)
 		shouldhelpgc = true
 		s = c.alloc[spc]
-
+		// 调用nextFreeIndex从mspan中获取空闲的内存并返回
 		freeIndex = s.nextFreeIndex()
 	}
 
@@ -888,7 +921,9 @@ func (c *mcache) nextFree(spc spanClass) (v gclinkptr, s *mspan, shouldhelpgc bo
 		throw("freeIndex is not valid")
 	}
 
+	// 这部分内容需要被 gc 接管，因此需要计算位置
 	v = gclinkptr(freeIndex*s.elemsize + s.base())
+	// 分配计数
 	s.allocCount++
 	if uintptr(s.allocCount) > s.nelems {
 		println("s.allocCount=", s.allocCount, "s.nelems=", s.nelems)
@@ -904,7 +939,7 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 	if gcphase == _GCmarktermination {
 		throw("mallocgc called with gcphase == _GCmarktermination")
 	}
-
+	// 创建大小为零的对象，例如空结构体
 	if size == 0 {
 		return unsafe.Pointer(&zerobase)
 	}
@@ -919,13 +954,14 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 			// This causes 64-bit atomic accesses to panic.
 			// Hence, we use stricter alignment that matches
 			// the normal allocator better.
-			if size&7 == 0 {
+			// 内存对齐相关
+			if size&7 == 0 {   // >= 8
 				align = 8
-			} else if size&3 == 0 {
+			} else if size&3 == 0 {  // == 4
 				align = 4
-			} else if size&1 == 0 {
+			} else if size&1 == 0 { // == 2
 				align = 2
-			} else {
+			} else {                // == 1
 				align = 1
 			}
 		}
@@ -954,6 +990,8 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 	}
 
 	// Set mp.mallocing to keep from being preempted by GC.
+	// 设置 mp.mallocing 以防止被GC抢占
+	// mp是什么？？？
 	mp := acquirem()
 	if mp.mallocing != 0 {
 		throw("malloc deadlock")
@@ -961,10 +999,12 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 	if mp.gsignal == getg() {
 		throw("malloc during signal")
 	}
-	mp.mallocing = 1
+	mp.mallocing = 1  // 设置 mp.mallocing为1， 以防止被GC抢占
 
 	shouldhelpgc := false
 	dataSize := size
+
+	// 获取线程缓存
 	var c *mcache
 	if mp.p != 0 {
 		c = mp.p.ptr().mcache
@@ -978,11 +1018,20 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 			throw("malloc called with no P")
 		}
 	}
+
+	// 这里才是真正进行内存分配的源码
 	var span *mspan
 	var x unsafe.Pointer
-	noscan := typ == nil || typ.ptrdata == 0
+	noscan := typ == nil || typ.ptrdata == 0    // noscan 表示是非指针类型
 	if size <= maxSmallSize {
+		// 类型的大小，小于等于小对象的最大内存：32KB
 		if noscan && size < maxTinySize {
+			// 1.微对象分配
+			// Go 语言运行时将小于 16 字节的对象划分为微对象，它会使用“线程缓存“上的“微分配器“提高微对象分配的性能。
+			// 主要使用它来分配较小的字符串以及逃逸的临时变量。
+			// 微分配器可以将多个较小的内存分配请求，合入同一个内存块中，只有当“内存块“【英文应该是block】中的所有对象都需要被回收时，整块内存才可能被回收。
+			// 微分配器管理的对象不可以是指针类型，管理多个对象的内存块大小 maxTinySize 是可以调整的，在默认情况下，内存块的大小为 16 字节。
+
 			// Tiny allocator.
 			//
 			// Tiny allocator combines several tiny allocation requests
@@ -1014,39 +1063,62 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 			// reduces heap size by ~20%.
 			off := c.tinyoffset
 			// Align tiny pointer for required (conservative) alignment.
-			if size&7 == 0 {
-				off = alignUp(off, 8)
-			} else if size&3 == 0 {
-				off = alignUp(off, 4)
-			} else if size&1 == 0 {
-				off = alignUp(off, 2)
+			if size&7 == 0 {                  // 8的n次幂，例如：8、16、32
+				off = alignUp(off, 8)      // 8字节对齐
+			} else if size&3 == 0 {           // 4的n次幂，例如：4、12 这里有个bug: 如果一个struct是12字节，且第一个字段是8字节，也不能保证8字节对齐。
+				off = alignUp(off, 4)      // 4字节对齐
+			} else if size&1 == 0 {           // 2的n次幂，例如：2、6
+				off = alignUp(off, 2)      // 2字节对齐
 			}
 			if off+size <= maxTinySize && c.tiny != 0 {
 				// The object fits into existing tiny block.
-				x = unsafe.Pointer(c.tiny + off)
-				c.tinyoffset = off + size
-				c.local_tinyallocs++
-				mp.mallocing = 0
+				// 如果当前块中还包含大小合适的空闲内存，会通过基地址【c.tiny】和偏移量【c.tinyoffset】，获取并返回这块内存
+				x = unsafe.Pointer(c.tiny + off)  // 取得存储微对象的内存块的地址
+				c.tinyoffset = off + size         // 下一个空闲内存块的起始便宜地址
+				c.local_tinyallocs++              // 已存储的微对象数量+1
+				mp.mallocing = 0                  // 更改mallocing对象的状态
 				releasem(mp)
 				return x
 			}
+
 			// Allocate a new maxTinySize block.
+			// 1.先线程缓存找到跨度类对应的内存管理单元 runtime.mspan
 			span = c.alloc[tinySpanClass]
+			// 2.调用 runtime.nextFreeFast 获取空闲的内存
 			v := nextFreeFast(span)
 			if v == 0 {
+				// 3.当不存在空闲内存时，我们会调用 runtime.mcache.nextFree 从中心缓存或者页堆中获取可分配的内存块
 				v, span, shouldhelpgc = c.nextFree(tinySpanClass)
 			}
 			x = unsafe.Pointer(v)
+			// 清空申请到的空闲内存的数据
 			(*[2]uint64)(x)[0] = 0
 			(*[2]uint64)(x)[1] = 0
 			// See if we need to replace the existing tiny block with the new one
 			// based on amount of remaining free space.
+			// 根据剩余的可用空间量，看看是否需要用新的小块替换现有的小块。
 			if size < c.tinyoffset || c.tiny == 0 {
+				// 更新tiny和tinyoffset
 				c.tiny = uintptr(x)
 				c.tinyoffset = size
 			}
 			size = maxTinySize
 		} else {
+			// 2.小对象分配
+			//当对一个小对象（<32KB）分配内存时，会将该对象所需的内存大小调整到某个能够容纳该对象的大小等级（size class），
+			//并查看 mcache 中对应等级的 mspan，通过扫描 mspan 的 freeindex 来确定是否能够进行分配。
+			//
+			//当没有可分配的 mspan 时，会从 mcentral 中获取一个所需大小空间的新的 mspan，
+			//从 mcentral 中分配会对其进行加锁， 但一次性获取整个 span 的过程均摊了对 mcentral 加锁的成本。
+			//
+			//如果 mcentral 的 mspan 也为空时，则它也会发生增长，从而从 mheap 中获取一连串的页，作为一个新的 mspan 进行提供。
+			//而如果 mheap 仍然为空，或者没有足够大的对象来进行分配时，则会从操作系统中分配一组新的页（至少 1MB）， 从而均摊与操作系统沟通的成本。
+
+			// 小对象是指大小为 16 字节到 32,768 字节的对象以及所有小于 16 字节的指针类型的对象
+			// 小对象的分配可以被分成以下的三个步骤：
+			// 1.确定分配拟对象的大小以及跨度类 spanClass
+			// 2.从线程缓存、中心缓存或者堆中获取内存管理单元【mspan】并从内存管理单元找到空闲的内存空间；
+			// 3.调用 runtime.memclrNoHeapPointers 清空空闲内存中的所有数据；
 			var sizeclass uint8
 			if size <= smallSizeMax-8 {
 				sizeclass = size_to_class8[divRoundUp(size, smallSizeDiv)]
@@ -1056,8 +1128,13 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 			size = uintptr(class_to_size[sizeclass])
 			spc := makeSpanClass(sizeclass, noscan)
 			span = c.alloc[spc]
+			// nextFreeFast会利用内存管理单元中的allocCache字段，快速找到该字段中位1的个数【1表示该位对应的内存空间是空闲的】
+			// 找到了空闲的对象后，我们就可以更新内存管理单元的 allocCache、freeindex 等字段并返回该片内存了
 			v := nextFreeFast(span)
 			if v == 0 {
+				// 如果没有找到，运行时会通过runtime.mcache.nextFree找到新的内存管理单元
+				// 里面会调用runtime.mcache.refill方法，使用中心缓存的内存管理单元替换已经不存在可用对象的内存管理单元
+				// 并调用runtime.mspan.nextFreeIndex获取空闲的内存并返回
 				v, span, shouldhelpgc = c.nextFree(spc)
 			}
 			x = unsafe.Pointer(v)
@@ -1066,6 +1143,9 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 			}
 		}
 	} else {
+		// 3.大对象分配
+		// 对于大对象【大于32KB】，不会从mcache或者mcentre中获取mspan，而是直接在“系统的栈【systemstack】“中调用runtime.largeAlloc函数分配大片的内存
+		// runtime.largeAlloc 函数会计算分配该对象所需要的页数，它会按照 8KB 的倍数为对象在堆上申请内存：
 		shouldhelpgc = true
 		systemstack(func() {
 			span = largeAlloc(size, needzero, noscan)
@@ -1159,11 +1239,13 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 
 func largeAlloc(size uintptr, needzero bool, noscan bool) *mspan {
 	// print("largeAlloc size=", size, "\n")
-
+	// 对象太大，溢出
 	if size+_PageSize < size {
 		throw("out of memory")
 	}
+	// 所需要的页数，每页8KB
 	npages := size >> _PageShift
+	// 还需要多一页
 	if size&_PageMask != 0 {
 		npages++
 	}
@@ -1172,8 +1254,9 @@ func largeAlloc(size uintptr, needzero bool, noscan bool) *mspan {
 	// necessary. mHeap_Alloc will also sweep npages, so this only
 	// pays the debt down to npage pages.
 	deductSweepCredit(npages*_PageSize, npages)
-
+	// 申请内存时，需要创建一个跨度类为0的runtime.spanClass
 	spc := makeSpanClass(0, noscan)
+	// 从堆上分配，调用alloc，分配一个对应内存大小的mspan
 	s := mheap_.alloc(npages, spc, needzero)
 	if s == nil {
 		throw("out of memory")
@@ -1191,8 +1274,10 @@ func largeAlloc(size uintptr, needzero bool, noscan bool) *mspan {
 // implementation of new builtin
 // compiler (both frontend and SSA backend) knows the signature
 // of this function
+// 内存分配的核心入口
+// _type: 为go类型的实现，通过其size属性能够获得该类型所需要的大小
 func newobject(typ *_type) unsafe.Pointer {
-	return mallocgc(typ.size, typ, true)
+	return mallocgc(typ.size, typ, true)  // true: 内存清零
 }
 
 //go:linkname reflect_unsafe_New reflect.unsafe_New
@@ -1339,10 +1424,12 @@ func persistentalloc1(size, align uintptr, sysStat *uint64) *notInHeap {
 	const (
 		maxBlock = 64 << 10 // VM reservation granularity is 64K on windows
 	)
-
+	// 不允许分配大小为 0 的空间
 	if size == 0 {
 		throw("persistentalloc: size == 0")
 	}
+	// 内存对齐单位 align 校验
+	// 对齐数必须为 2 的指数、且不大于 PageSize
 	if align != 0 {
 		if align&(align-1) != 0 {
 			throw("persistentalloc: align is not a power of 2")
@@ -1351,21 +1438,26 @@ func persistentalloc1(size, align uintptr, sysStat *uint64) *notInHeap {
 			throw("persistentalloc: align is too large")
 		}
 	} else {
+		// 若未指定则默认为 8
 		align = 8
 	}
-
+	// 分配大内存：分配的大小如果超过最大的 block 大小【64KB】，则直接调用 sysAlloc 进行分配
 	if size >= maxBlock {
 		return (*notInHeap)(sysAlloc(size, sysStat))
 	}
-
+	// 分配小内存：在 m 上进行
+	// 先获取 m
 	mp := acquirem()
 	var persistent *persistentAlloc
 	if mp != nil && mp.p != 0 {
+		// 如果能够获取到 m 且同时持有 p，则直接分配到 p 的 palloc 上
 		persistent = &mp.p.ptr().palloc
 	} else {
+		// 否则就分配到全局的 globalAlloc.persistentAlloc 上
 		lock(&globalAlloc.mutex)
 		persistent = &globalAlloc.persistentAlloc
 	}
+	// 四舍五入 off 到 align 的倍数
 	persistent.off = alignUp(persistent.off, align)
 	if persistent.off+size > persistentChunkSize || persistent.base == nil {
 		persistent.base = (*notInHeap)(sysAlloc(persistentChunkSize, &memstats.other_sys))
@@ -1459,6 +1551,8 @@ func (l *linearAlloc) alloc(size, align uintptr, sysStat *uint64) unsafe.Pointer
 // possible (like in the allocators).
 //
 // TODO: Use this as the return type of sysAlloc, persistentAlloc, etc?
+// 这是个指令，表示这个类型不允许从GC堆上进行申请内存。在运行时中常用其来做较低层次的内部结构，避免调度器和内存分配器中的写屏障，能够提高性能。
+// 详见：https://segmentfault.com/a/1190000018719140
 //
 //go:notinheap
 type notInHeap struct{}

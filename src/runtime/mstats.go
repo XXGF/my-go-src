@@ -445,9 +445,12 @@ func init() {
 // call to ReadMemStats. This is in contrast with a heap profile,
 // which is a snapshot as of the most recently completed garbage
 // collection cycle.
+// 对外的读取内存统计数据的方法，读取的过程中需要stop the world
 func ReadMemStats(m *MemStats) {
 	stopTheWorld("read mem stats")
-
+	// 对于 readmemstats_m 而言，是将运行时用于内存统计的 变量 memstats 中的值拷贝到用户态的 MemStats 中，
+	// 不过这样进行 memove 操作 是发生在 "系统栈" 上的，
+	// 因此这部分的内存实际上是 OS 栈上的内存，因此最后还给用户加上 stats.StackInuse 的值来保证完整性：
 	systemstack(func() {
 		readmemstats_m(m)
 	})
@@ -456,15 +459,19 @@ func ReadMemStats(m *MemStats) {
 }
 
 func readmemstats_m(stats *MemStats) {
+	// updatememstats 是为了将 STW 之后未完整统计的内存信息统一更新到 memstats 中
 	updatememstats()
 
 	// The size of the trailing by_size array differs between
 	// mstats and MemStats. NumSizeClasses was changed, but we
 	// cannot change MemStats because of backward compatibility.
+	// 将运行时 memstats 变量拷贝到 stats 中
 	memmove(unsafe.Pointer(stats), unsafe.Pointer(&memstats), sizeof_C_MStats)
 
 	// memstats.stacks_sys is only memory mapped directly for OS stacks.
 	// Add in heap-allocated stack memory for user consumption.
+	// 因为 memstats.stacks_sys 是唯一直接映射到 OS 栈的内存。
+	// 所以这里加上了堆分配的栈内存以供用户使用。
 	stats.StackSys += stats.StackInuse
 }
 
@@ -525,6 +532,7 @@ func updatememstats() {
 		memstats.mcache_sys + memstats.buckhash_sys + memstats.gc_sys + memstats.other_sys
 
 	// We also count stacks_inuse as sys memory.
+	// 将 stacks_inuse 作为系统内存进行计算
 	memstats.sys += memstats.stacks_inuse
 
 	// Calculate memory allocator stats.
@@ -534,6 +542,13 @@ func updatememstats() {
 	// Total number of mallocs is calculated as number of frees plus number of alive objects.
 	// Similarly, total amount of allocated memory is calculated as amount of freed memory
 	// plus amount of alive heap memory.
+	// 计算内存分配器统计信息。
+	// 在程序执行期间，运行时只计算释放的数量和释放的内存量。
+	// 堆中当前活动对象的数量和活动堆内存的数量
+	// 通过扫描所有 span 计算。
+	// malloc 的总数计算为 frees 数和活动对象数。
+	// 类似地，分配的内存总量计算为释放的内存量
+	// 加上活跃堆内存的数量。
 	memstats.alloc = 0
 	memstats.total_alloc = 0
 	memstats.nmalloc = 0
@@ -544,15 +559,19 @@ func updatememstats() {
 	}
 
 	// Aggregate local stats.
+	// 汇总本地统计数据
 	cachestats()
 
 	// Collect allocation stats. This is safe and consistent
 	// because the world is stopped.
+	// 统计分配信息，因为 STW 所以安全
 	var smallFree, totalAlloc, totalFree uint64
 	// Collect per-spanclass stats.
+	// 搜集每个 span 等级的统计
 	for spc := range mheap_.central {
 		// The mcaches are now empty, so mcentral stats are
 		// up-to-date.
+		// mcaches 现在为空，因此 mcentral 统计已经是最新的了
 		c := &mheap_.central[spc].mcentral
 		memstats.nmalloc += c.nmalloc
 		i := spanClass(spc).sizeclass()
@@ -561,6 +580,7 @@ func updatememstats() {
 	}
 	// Collect per-sizeclass stats.
 	for i := 0; i < _NumSizeClasses; i++ {
+		// 收集每个spanClass大小等级的信息
 		if i == 0 {
 			memstats.nmalloc += mheap_.nlargealloc
 			totalAlloc += mheap_.largealloc
@@ -580,10 +600,13 @@ func updatememstats() {
 	memstats.nmalloc += memstats.tinyallocs
 
 	// Calculate derived stats.
+	// 计算派生数据
 	memstats.total_alloc = totalAlloc
 	memstats.alloc = totalAlloc - totalFree
 	memstats.heap_alloc = memstats.alloc
 	memstats.heap_objects = memstats.nmalloc - memstats.nfree
+
+	// 总结: 这里只是读取时候对全部信息进行的同步，在分配的过程中还有很多直接统计的代码。
 }
 
 // cachestats flushes all mcache stats.
