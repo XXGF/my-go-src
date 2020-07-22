@@ -970,6 +970,11 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 
 	// assistG is the G to charge for this allocation, or nil if
 	// GC is not currently active.
+	// 为了保证用户程序分配内存的速度不会超出后台任务的标记速度，运行时还引入了标记辅助技术，
+	// 它遵循一条非常简单并且朴实的原则，分配多少内存就需要完成多少标记任务。
+	// 每一个 Goroutine 都持有 gcAssistBytes 字段，这个字段存储了当前 Goroutine 辅助标记的对象字节数。
+	// 在并发标记阶段期间，当 Goroutine 调用 runtime.mallocgc 分配新的对象时，
+	// 该函数会检查申请内存的 Goroutine 是否处于入不敷出的状态
 	var assistG *g
 	if gcBlackenEnabled != 0 {
 		// Charge the current user G for this allocation.
@@ -979,12 +984,15 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 		}
 		// Charge the allocation against the G. We'll account
 		// for internal fragmentation at the end of mallocgc.
+		// 每个 Goroutine 持有的 gcAssistBytes 表示当前协程辅助标记的字节数
 		assistG.gcAssistBytes -= int64(size)
 
 		if assistG.gcAssistBytes < 0 {
 			// This G is in debt. Assist the GC to correct
 			// this before allocating. This must happen
 			// before disabling preemption.
+			// 申请内存时调用的 runtime.gcAssistAlloc 和扫描内存时调用的 runtime.gcFlushBgCredit 分别负责『借债』和『还债』，
+			// 通过这套债务管理系统，我们能够保证 Goroutine 在正常运行的同时不会为垃圾收集造成太多的压力，保证在达到堆大小目标时完成标记阶段。
 			gcAssistAlloc(assistG)
 		}
 	}
@@ -1089,6 +1097,7 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 			if v == 0 {
 				// 3.当不存在空闲内存时，我们会调用 runtime.mcache.nextFree 从中心缓存或者页堆中获取可分配的内存块
 				v, span, shouldhelpgc = c.nextFree(tinySpanClass)
+				// GC相关：当前线程的内存管理单元中不存在空闲空间时，创建微对象和小对象需要调用 runtime.mcache.nextFree 方法从中心缓存或者页堆中获取新的管理单元，在这时就可能触发垃圾收集；
 			}
 			x = unsafe.Pointer(v)
 			// 清空申请到的空闲内存的数据
@@ -1146,6 +1155,8 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 		// 3.大对象分配
 		// 对于大对象【大于32KB】，不会从mcache或者mcentre中获取mspan，而是直接在“系统的栈【systemstack】“中调用runtime.largeAlloc函数分配大片的内存
 		// runtime.largeAlloc 函数会计算分配该对象所需要的页数，它会按照 8KB 的倍数为对象在堆上申请内存：
+
+		// GC相关：当用户程序申请分配 32KB 以上的大对象时，一定会构建 runtime.gcTrigger 结构体尝试触发 垃圾收集；
 		shouldhelpgc = true
 		systemstack(func() {
 			span = largeAlloc(size, needzero, noscan)
@@ -1193,7 +1204,11 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 	// All slots hold nil so no scanning is needed.
 	// This may be racing with GC so do it atomically if there can be
 	// a race marking the bit.
+	// runtime.mallocgc 会在垃圾收集开始后调用该函数，获取对象对应的内存单元以及标记位 runtime.markBits
+	// 并调用 runtime.markBits.setMarked 直接将新的对象涂成黑色。
 	if gcphase != _GCoff {
+		// 我们在上面提到过 Dijkstra 和 Yuasa 写屏障组成的混合写屏障在开启后，
+		// 所有新创建的对象都需要被直接涂成黑色，这里的标记过程是由 runtime.gcmarknewobject 完成的
 		gcmarknewobject(span, uintptr(x), size, scanSize)
 	}
 
@@ -1228,6 +1243,7 @@ func mallocgc(size uintptr, typ *_type, needzero bool) unsafe.Pointer {
 		assistG.gcAssistBytes -= int64(size - dataSize)
 	}
 
+	// GC相关：当用户程序申请分配 32KB 以上的大对象时，一定会构建 runtime.gcTrigger 结构体尝试触发 垃圾收集；
 	if shouldhelpgc {
 		if t := (gcTrigger{kind: gcTriggerHeap}); t.test() {
 			gcStart(t)

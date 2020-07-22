@@ -167,6 +167,8 @@ var heapminimum uint64 = defaultHeapMinimum
 const defaultHeapMinimum = 4 << 20
 
 // Initialized from $GOGC.  GOGC=off means no GC.
+// 是触发垃圾收集的内存增长百分比，默认情况下为 100，即堆内存相比上次垃圾收集增长 100% 时应该触发 GC，
+// 并行的垃圾收集器会在到达该目标前完成垃圾收集；
 var gcpercent int32
 
 func gcinit() {
@@ -175,11 +177,16 @@ func gcinit() {
 	}
 
 	// No sweep on the first cycle.
+	// 第一个周期没有清扫
 	mheap_.sweepdone = 1
 
+	// 设置合理的初始化 gc 触发率
 	// Set a reasonable initial GC trigger.
 	memstats.triggerRatio = 7 / 8.0
 
+	// 伪造一个 heap_marked 值
+	// 使它看起来像一个触发器，heapmininum 是 heap_marked的适当增长
+	// 这将用于计算初始GC目标
 	// Fake a heap_marked value so it looks like a trigger at
 	// heapminimum is the appropriate growth from heap_marked.
 	// This will go into computing the initial GC goal.
@@ -187,7 +194,9 @@ func gcinit() {
 
 	// Set gcpercent from the environment. This will also compute
 	// and set the GC trigger and goal.
-	_ = setGCPercent(readgogc())
+	// 从环境中设置 gcprecent
+	// 这也将计算并设置GC触发器和目标
+	_ = setGCPercent(readgogc()) // 读取 GOGC 全局变量
 
 	work.startSema = 1
 	work.markDoneSema = 1
@@ -213,11 +222,13 @@ func readgogc() int32 {
 // scavenger goroutine, and enables GC.
 func gcenable() {
 	// Kick off sweeping and scavenging.
+	// 启动 bgsweep 和 bgscavenge
 	c := make(chan int, 2)
 	go bgsweep(c)
 	go bgscavenge(c)
 	<-c
 	<-c
+	// 现在运行时已经初始化完毕了，GC 已就绪
 	memstats.enablegc = true // now that runtime is initialized, GC is okay
 }
 
@@ -248,12 +259,16 @@ func setGCPercent(in int32) (out int32) {
 
 // Garbage collector phase.
 // Indicates to write barrier and synchronization task to perform.
+// 垃圾收集器当前处于的阶段，
+// 可能处于 _GCoff、_GCmark 和 _GCmarktermination，
+// Goroutine 在读取或者修改该字段时需要保证原子性；
 var gcphase uint32
 
 // The compiler knows about this variable.
 // If you change it, you must change builtin/runtime.go, too.
 // If you change the first four bytes, you must also change the write
 // barrier insertion code.
+// 是一个包含写屏障状态的结构体，其中的 enabled 字段表示写屏障的开启与关闭；
 var writeBarrier struct {
 	enabled bool    // compiler emits a check of this before calling write barrier
 	pad     [3]byte // compiler uses 32-bit load for "enabled" field
@@ -265,18 +280,29 @@ var writeBarrier struct {
 // gcBlackenEnabled is 1 if mutator assists and background mark
 // workers are allowed to blacken objects. This must only be set when
 // gcphase == _GCmark.
+// 是一个布尔值，当垃圾收集处于标记阶段时，该变量会被置为 1，
+// 此时，辅助垃圾收集的用户程序和后台标记的任务可以将对象涂黑；
 var gcBlackenEnabled uint32
 
+// 在运行时代码中，阶段切换的标记非常明确：
+// 在gcStart时，切换到Mark标记阶段
+// 在标记工作完成的时候，切换到Marktermination阶段，并在完成标记后切换到Off阶段，停用写屏障
 const (
+	// GC 没有运行，sweep在后台运行，写屏障没有开启
 	_GCoff             = iota // GC not running; sweeping in background, write barrier disabled
+	// GC 标记roots和workbufs：分配黑色，写屏障启用
 	_GCmark                   // GC marking roots and workbufs: allocate black, write barrier ENABLED
+	// GC 标记终止：分配黑色，P`s帮助GC，写屏障启用
 	_GCmarktermination        // GC mark termination: allocate black, P's help GC, write barrier ENABLED
 )
 
+// 当需要进行 GC 阶段切换时，主要就是控制 gcphase 和 writeBarrier 这两个变量
 //go:nosplit
 func setGCPhase(x uint32) {
 	atomic.Store(&gcphase, x)
+	// 只有mark和marktermination才需要写屏障
 	writeBarrier.needed = gcphase == _GCmark || gcphase == _GCmarktermination
+	// 只有需要或者 cgo 时候才启用写屏障
 	writeBarrier.enabled = writeBarrier.needed || writeBarrier.cgo
 }
 
@@ -287,6 +313,11 @@ func setGCPhase(x uint32) {
 // is mutator assists, which happen in response to allocations and are
 // not scheduled. The other three are variations in the per-P mark
 // workers and are distinguished by gcMarkWorkerMode.
+// 三种不同模式的 Goroutine 在标记对象时使用完全不同的策略，垃圾收集控制器会按照需要执行不同类型的工作协程：
+//
+//gcMarkWorkerDedicatedMode — 处理器专门负责标记对象，不会被调度器抢占；
+//gcMarkWorkerFractionalMode — 当垃圾收集的后台 CPU 使用率达不到预期时（默认为 25%），启动该类型的工作协程帮助垃圾收集达到利用率的目标，因为它只占用同一个 CPU 的部分资源，所以可以被调度；
+//gcMarkWorkerIdleMode — 当处理器没有可以执行的 Goroutine 时，它会运行垃圾收集的标记任务直到被抢占；
 type gcMarkWorkerMode int
 
 const (
@@ -331,6 +362,7 @@ var gcMarkWorkerModeStrings = [...]string{
 //
 // All fields of gcController are used only during a single mark
 // cycle.
+// 实现了垃圾收集的调步算法，它能够决定触发并行垃圾收集的时间和待处理的工作；
 var gcController gcControllerState
 
 type gcControllerState struct {
@@ -943,6 +975,7 @@ const gcAssistTimeSlack = 5000
 // assist by pre-paying for this many bytes of future allocations.
 const gcOverAssistWork = 64 << 10
 
+// 该结构体中包含大量垃圾收集的相关字段，例如：表示完成的垃圾收集循环的次数、当前循环时间和 CPU 的利用率、垃圾收集的模式等等
 var work struct {
 	full  lfstack          // lock-free list of full blocks workbuf
 	empty lfstack          // lock-free list of empty blocks workbuf
@@ -1061,6 +1094,15 @@ var work struct {
 // GC runs a garbage collection and blocks the caller until the
 // garbage collection is complete. It may also block the entire
 // program.
+// 手动触发垃圾收集：
+// 用户程序会通过 runtime.GC 函数在程序运行期间主动通知运行时执行，
+// 该方法在调用时会阻塞调用方直到当前垃圾收集循环完成，
+// 在垃圾收集期间也可能会通过 STW 暂停整个程序
+//
+// 1.在正式开始垃圾收集前，运行时需要通过 runtime.gcWaitOnMark 函数等待上一个循环的标记终止、标记和标记终止阶段完成；
+// 2.调用 runtime.gcStart 触发新一轮的垃圾收集并通过 runtime.gcWaitOnMark 等待该轮垃圾收集的标记终止阶段正常结束；
+// 3.持续调用 runtime.sweepone 清理全部待处理的内存管理单元并等待所有的清理工作完成，等待期间会调用 runtime.Gosched 让出处理器；
+// 4.完成本轮垃圾收集的清理工作后，通过 runtime.mProf_PostSweep 将该阶段的堆内存状态快照发布出来，我们可以获取这时的内存状态；
 func GC() {
 	// We consider a cycle to be: sweep termination, mark, mark
 	// termination, and sweep. This function shouldn't return
@@ -1089,20 +1131,25 @@ func GC() {
 	// Wait until the current sweep termination, mark, and mark
 	// termination complete.
 	n := atomic.Load(&work.cycles)
+	// 1.在正式开始垃圾收集前，运行时需要通过 runtime.gcWaitOnMark 函数等待上一个循环的标记终止、标记和标记终止阶段完成；
 	gcWaitOnMark(n)
 
 	// We're now in sweep N or later. Trigger GC cycle N+1, which
 	// will first finish sweep N if necessary and then enter sweep
 	// termination N+1.
+	// 2.调用 runtime.gcStart 触发新一轮的垃圾收集
 	gcStart(gcTrigger{kind: gcTriggerCycle, n: n + 1})
 
 	// Wait for mark termination N+1 to complete.
+	// 并通过 runtime.gcWaitOnMark 等待该轮垃圾收集的标记终止阶段正常结束；
 	gcWaitOnMark(n + 1)
 
 	// Finish sweep N+1 before returning. We do this both to
 	// complete the cycle and because runtime.GC() is often used
 	// as part of tests and benchmarks to get the system into a
-	// relatively stable and isolated state.
+	// relatively stable and isolated state.]
+
+	// 3.持续调用 runtime.sweepone 清理全部待处理的内存管理单元并等待所有的清理工作完成，等待期间会调用 runtime.Gosched 让出处理器；
 	for atomic.Load(&work.cycles) == n+1 && sweepone() != ^uintptr(0) {
 		sweep.nbgsweep++
 		Gosched()
@@ -1129,6 +1176,7 @@ func GC() {
 	mp := acquirem()
 	cycle := atomic.Load(&work.cycles)
 	if cycle == n+1 || (gcphase == _GCmark && cycle == n+2) {
+		// 4.完成本轮垃圾收集的清理工作后，通过 runtime.mProf_PostSweep 将该阶段的堆内存状态快照发布出来，我们可以获取这时的内存状态；
 		mProf_PostSweep()
 	}
 	releasem(mp)
@@ -1201,14 +1249,20 @@ func (t gcTrigger) test() bool {
 	if !memstats.enablegc || panicking != 0 || gcphase != _GCoff {
 		return false
 	}
+	// 1.允许垃圾收集
+	// 2.程序没有崩溃
+	// 3.没有处于垃圾收集循环
+
 	switch t.kind {
 	case gcTriggerHeap:
 		// Non-atomic access to heap_live for performance. If
 		// we are going to trigger on this, this thread just
 		// atomically wrote heap_live anyway and we'll see our
 		// own write.
+		// 堆内存的分配达到达控制器计算的触发堆大小
 		return memstats.heap_live >= memstats.gc_trigger
 	case gcTriggerTime:
+		// 如果一定时间内没有触发，就会触发新的循环，该出发条件由 runtime.forcegcperiod 变量控制，默认为 2 分钟；
 		if gcpercent < 0 {
 			return false
 		}
@@ -1216,6 +1270,7 @@ func (t gcTrigger) test() bool {
 		return lastgc != 0 && t.now-lastgc > forcegcperiod
 	case gcTriggerCycle:
 		// t.n > work.cycles, but accounting for wraparound.
+		// 如果当前没有开启垃圾收集，则触发新的循环
 		return int32(t.n-work.cycles) > 0
 	}
 	return true
@@ -1227,12 +1282,26 @@ func (t gcTrigger) test() bool {
 //
 // This may return without performing this transition in some cases,
 // such as when called on a system stack or with locks held.
+
+// gcStart 是 GC 正式开始的地方，它有以下几种触发方式：
+//
+// 1.强制被系统监控触发
+// 2.在 mallocgc 分配内存时触发
+// 3.通过 runtime.GC() 调用触发
+
+// 垃圾收集在启动过程一定会调用 runtime.gcStart 函数，
+// 虽然该函数的实现比较复杂，但是它的主要职责就是修改全局的垃圾收集状态到 _GCmark 并做一些准备工作，
+// 我们会分以下几个阶段介绍该函数的实现：
+// 1.两次调用 runtime.gcTrigger.test 方法检查是否满足垃圾收集条件
+// 2.暂停程序、在后台启动用于处理标记任务的工作Goroutine、确定所有内存管理单元都被清理以及其他标记阶段开始前的准备工作
+// 3.进入标记阶段、准备后台的标记工作、根对象的标记工作以及微对象、恢复用户程序，进入并发扫描和标记阶段
 func gcStart(trigger gcTrigger) {
 	// Since this is called from malloc and malloc is called in
 	// the guts of a number of libraries that might be holding
 	// locks, don't attempt to start GC in non-preemptible or
 	// potentially unstable situations.
 	mp := acquirem()
+	// 不要在非抢占或者m被锁的情况下，启动GC
 	if gp := getg(); gp == mp.g0 || mp.locks > 1 || mp.preemptoff != "" {
 		releasem(mp)
 		return
@@ -1250,14 +1319,19 @@ func gcStart(trigger gcTrigger) {
 	//
 	// We check the transition condition continuously here in case
 	// this G gets delayed in to the next GC cycle.
+	// 记录已经启动的 sweeper 数量
+	// 验证垃圾收集条件的同时，该方法还会在循环中不断调用 runtime.sweepone 清理已经被标记的内存单元，完成上一个垃圾收集循环的收尾工作：
 	for trigger.test() && sweepone() != ^uintptr(0) {
 		sweep.nbgsweep++
 	}
 
 	// Perform GC initialization and the sweep termination
 	// transition.
+	// 执行 GC 初始化，以及 sweep 终止转换 termination transition
+	// 在验证了垃圾收集的条件并完成了收尾工作后，该方法会通过 semacquire 获取全局的 worldsema 信号量【用于STW】
 	semacquire(&work.startSema)
 	// Re-check transition condition under transition lock.
+	// 在持有锁的情况下 重新检查转换条件，若不需要触发则不触发
 	if !trigger.test() {
 		semrelease(&work.startSema)
 		return
@@ -1293,10 +1367,18 @@ func gcStart(trigger gcTrigger) {
 		}
 	}
 
+	///////////////////////////// 进入标记阶段前的准备工作，需要STW ////////////////////////////////
+
+	// 启动mark worker
+	// 在垃圾收集启动期间，运行时会调用 runtime.gcBgMarkStartWorkers 为全局每个处理器创建用于执行后台标记任务的 Goroutine，
+	// 每一个 Goroutine 都会运行 runtime.gcBgMarkWorker，
+	// 所有运行 runtime.gcBgMarkWorker 的 Goroutine 在启动后都会陷入休眠等待调度器的唤醒：
 	gcBgMarkStartWorkers()
 
+	// 重置mark状态
 	systemstack(gcResetMarkState)
 
+	// 记录此次 GC 时 STW 的各项信息，用于计算下一次 GC 周期的触发时间
 	work.stwprocs, work.maxprocs = gomaxprocs, gomaxprocs
 	if work.stwprocs > ncpu {
 		// This is used to compute CPU time of the STW phases,
@@ -1313,9 +1395,11 @@ func gcStart(trigger gcTrigger) {
 	if trace.enabled {
 		traceGCSTWStart(1)
 	}
+	// --------------- STW开始 -------------------
 	systemstack(stopTheWorldWithSema)
 	// Finish sweep before we start concurrent scan.
 	systemstack(func() {
+		// 等待 sweeper 完成，确保所有 span 已被清除
 		finishsweep_m()
 	})
 
@@ -1325,6 +1409,7 @@ func gcStart(trigger gcTrigger) {
 
 	work.cycles++
 
+	// 会根据全局处理器的个数以及垃圾收集的 CPU 利用率计算出上述的 dedicatedMarkWorkersNeeded 和 fractionalUtilizationGoal 以决定不同模式的工作协程的数量。
 	gcController.startCycle()
 	work.heapGoal = memstats.next_gc
 
@@ -1349,9 +1434,17 @@ func gcStart(trigger gcTrigger) {
 	// allocations are blocked until assists can
 	// happen, we want enable assists as early as
 	// possible.
+	// 设置GC阶段为Mark
+	// 进入并发标记阶段并启用写障碍。
+	// 因为世界已经停止，所有 Ps 都会观察到，当我们开始世界并开始扫描时，写入障碍就会被启用。
+	// 写屏障必须在 assists 之前启用，因为必须在标记任何非叶堆对象之前启用它们。
+	// 由于分配被阻止直到 assists 可能发生，我们希望尽早启用 assists。
 	setGCPhase(_GCmark)
 
+	// 在完成全部的准备工作后，盖该方法就进入了执行的最后阶段。在该阶段中，我们会修改全局的垃圾收集状态到 _GCmark 并依次执行下面的步骤：
+	// 1.调用 runtime.gcBgMarkPrepare 函数初始化后台扫描需要的状态
 	gcBgMarkPrepare() // Must happen before assist enable.
+	// 2.调用 runtime.gcMarkRootPrepare 函数扫描栈上、全局变量等根对象并将它们加入队列；
 	gcMarkRootPrepare()
 
 	// Mark all active tinyalloc blocks. Since we're
@@ -1366,6 +1459,7 @@ func gcStart(trigger gcTrigger) {
 	// black invariant. Enable mutator assists to
 	// put back-pressure on fast allocating
 	// mutators.
+	// 3.设置全局变量 runtime.gcBlackenEnabled，用户程序和标记任务可以将对象涂黑；
 	atomic.Store(&gcBlackenEnabled, 1)
 
 	// Assists and workers can start the moment we start
@@ -1378,7 +1472,9 @@ func gcStart(trigger gcTrigger) {
 
 	// Concurrent mark.
 	systemstack(func() {
-		now = startTheWorldWithSema(trace.enabled)
+		// -------------------- STW结束 -----------------
+		// 4.调用 runtime.startTheWorldWithSema 启动程序，后台任务也会开始标记堆中的对象；
+		now = startTheWorldWithSema(trace.enabled) // STW结束
 		work.pauseNS += now - work.pauseStart
 		work.tMark = now
 	})
@@ -1441,6 +1537,11 @@ var gcWorkPauseGen uint32 = 1
 // it does transition to mark termination, then all reachable objects
 // have been marked, so the write barrier cannot shade any more
 // objects.
+
+// 当所有处理器的本地任务都完成并且不存在剩余的工作 Goroutine 时，
+// 后台并发任务或者辅助标记的用户程序会调用 runtime.gcMarkDone 通知垃圾收集器。
+
+// 将GC从mark阶段，转成mark termination阶段
 func gcMarkDone() {
 	// Ensure only one thread is running the ragged barrier at a
 	// time.
@@ -1544,6 +1645,7 @@ top:
 	if trace.enabled {
 		traceGCSTWStart(0)
 	}
+	// ------------------------- STW开始 ----------------------------
 	systemstack(stopTheWorldWithSema)
 	// The gcphase is _GCmark, it will transition to _GCmarktermination
 	// below. The important thing is that the wb remains active until
@@ -1596,6 +1698,8 @@ top:
 		if restart {
 			getg().m.preemptoff = ""
 			systemstack(func() {
+				// 这个结束是有条件的，即 !p.gcw.empty()
+				// ------------------- STW结束 ------------------------
 				now := startTheWorldWithSema(true)
 				work.pauseNS += now - work.pauseStart
 			})
@@ -1604,6 +1708,8 @@ top:
 		}
 	}
 
+	// 如果运行时中不包含全局任务、处理器中也不存在本地任务，那么当前垃圾收集循环中的灰色对象也就都标记成了黑色，
+	// 我们就可以开始触发垃圾收集的阶段迁移了
 	// Disable assists and background workers. We must do
 	// this before waking blocked assists.
 	atomic.Store(&gcBlackenEnabled, 0)
@@ -1628,8 +1734,17 @@ top:
 
 	// Perform mark termination. This will restart the world.
 	gcMarkTermination(nextTriggerRatio)
+
+	// 上述函数在最后会关闭混合写屏障、唤醒所有协助垃圾收集的用户程序、恢复用户 Goroutine 的调度
+	// 并调用 runtime.gcMarkTermination 进入标记终止阶段：
 }
 
+// 我们省略了撒行数函数中很多数据统计的代码，包括正在使用的内存大小、本轮垃圾收集的暂停时间、CPU 的利用率等数据，
+// 这些数据能够帮助控制器决定下一轮触发垃圾收集的堆大小，
+// 除了数据统计之外，该函数还会调用 runtime.gcSweep 重置清理阶段的相关状态并在需要时阻塞清理所有的内存管理单元；
+// _GCmarktermination 状态在垃圾收集中并不会持续太久，它会迅速转换至 _GCoff 并恢复应用程序，
+// 到这里垃圾收集的全过程基本上就结束了，
+// *******用户程序在申请内存时才会惰性回收内存。********
 func gcMarkTermination(nextTriggerRatio float64) {
 	// World is stopped.
 	// Start marktermination which includes enabling the write barrier.
@@ -1681,6 +1796,7 @@ func gcMarkTermination(nextTriggerRatio float64) {
 
 		// marking is complete so we can turn the write barrier off
 		setGCPhase(_GCoff)
+		// 该函数还会调用 runtime.gcSweep 重置清理阶段的相关状态并在需要时阻塞清理所有的内存管理单元
 		gcSweep(work.mode)
 	})
 
@@ -1749,6 +1865,7 @@ func gcMarkTermination(nextTriggerRatio float64) {
 	// so events don't leak into the wrong cycle.
 	mProf_NextCycle()
 
+	// ------------------------ STW结束 ------------------------
 	systemstack(func() { startTheWorldWithSema(true) })
 
 	// Flush the heap profile so we can start a new cycle next GC.
@@ -1831,13 +1948,20 @@ func gcMarkTermination(nextTriggerRatio float64) {
 // These goroutines will not run until the mark phase, but they must
 // be started while the work is not stopped and from a regular G
 // stack. The caller must hold worldsema.
+
+// gcBgMarkStartWorkers 准备后台标记 worker goroutines。
+// 这些 goroutine 直到标记阶段才会运行，但它们必须在工作未停止时从常规 G 栈启动。调用方必须持有 worldsema。
 func gcBgMarkStartWorkers() {
 	// Background marking is performed by per-P G's. Ensure that
 	// each P has a background GC G.
+	// 后台 mark 分别每个 P 上执行。确保每个 P 都有一个后台 GC G
 	for _, p := range allp {
 		if p.gcBgMarkWorker == 0 {
+			// 启动一个 goroutine 来运行 mark worker
 			go gcBgMarkWorker(p)
+			// 休眠，直到 gcBgMarkWorker 就绪
 			notetsleepg(&work.bgMarkReady, -1)
+			// 这时启动继续启动下一个 Worker
 			noteclear(&work.bgMarkReady)
 		}
 	}
@@ -1858,10 +1982,15 @@ func gcBgMarkPrepare() {
 	work.nproc = ^uint32(0)
 	work.nwait = ^uint32(0)
 }
-
+// runtime.gcBgMarkWorker 是后台的标记任务执行的函数，该函数的循环中执行了对内存中对象图的扫描和标记，
+// 我们分三个部分介绍该函数的实现原理：
+// 1.获取当前处理器以及 Goroutine 打包成 parkInfo 类型的结构体并主动陷入休眠等待唤醒；
+// 2.根据处理器上的 gcMarkWorkerMode 模式决定扫描任务的策略；
+// 3.所有标记任务都完成后，调用 runtime.gcMarkDone 方法完成标记阶段；
 func gcBgMarkWorker(_p_ *p) {
 	gp := getg()
-
+	// 运行时在这里创建了一个 parkInfo 结构体，该结构体会预先存储处理器和当前 Goroutine，
+	// 当我们调用 runtime.gopark 触发休眠时，运行时会在系统栈中安全地建立处理器和后台标记任务的绑定关系
 	type parkInfo struct {
 		m      muintptr // Release this m on park.
 		attach puintptr // If non-nil, attach to this p on park.
@@ -1888,6 +2017,8 @@ func gcBgMarkWorker(_p_ *p) {
 		// Go to sleep until woken by gcController.findRunnable.
 		// We can't releasem yet since even the call to gopark
 		// may be preempted.
+		// 通过 runtime.gopark 陷入休眠的 Goroutine 不会进入运行队列，它只会等待垃圾收集控制器或者调度器的直接唤醒
+		// 在唤醒后，我们会根据处理器 gcMarkWorkerMode 选择不同的标记执行策略，不同的执行策略都会调用 runtime.gcDrain 扫描工作缓冲区 runtime.gcWork
 		gopark(func(g *g, parkp unsafe.Pointer) bool {
 			park := (*parkInfo)(parkp)
 
@@ -1954,7 +2085,14 @@ func gcBgMarkWorker(_p_ *p) {
 			switch _p_.gcMarkWorkerMode {
 			default:
 				throw("gcBgMarkWorker: unexpected gcMarkWorkerMode")
+				// 处理器专门负责标记对象，不会被调度器抢占 【Dedicated 专用的】
 			case gcMarkWorkerDedicatedMode:
+				// 在唤醒后，我们会根据处理器 gcMarkWorkerMode 选择不同的标记执行策略，
+				// 不同的执行策略都会调用 runtime.gcDrain 扫描工作缓冲区 runtime.gcWork
+
+				// gcMarkWorkerDedicatedMode 模式的任务是不能被抢占的
+				// 为了减少额外开销，第一次调用 runtime.gcDrain 方法时是允许抢占的，
+				// 但是一旦处理器被抢占，当前 Goroutine会将处理器上的所有可运行的 Goroutine 转移至全局队列中，保证垃圾收集占用的 CPU 资源。
 				gcDrain(&_p_.gcw, gcDrainUntilPreempt|gcDrainFlushBgCredit)
 				if gp.preempt {
 					// We were preempted. This is
@@ -1975,8 +2113,11 @@ func gcBgMarkWorker(_p_ *p) {
 				// Go back to draining, this time
 				// without preemption.
 				gcDrain(&_p_.gcw, gcDrainFlushBgCredit)
+				// 当垃圾收集的后台 CPU 使用率达不到预期时（默认为 25%），启动该类型的工作协程帮助垃圾收集达到利用率的目标，因为它只占用同一个 CPU 的部分资源，所以可以被调度；
+				// 【Fractional: 微小的，极小的】
 			case gcMarkWorkerFractionalMode:
 				gcDrain(&_p_.gcw, gcDrainFractional|gcDrainUntilPreempt|gcDrainFlushBgCredit)
+				// 当处理器没有可以执行的 Goroutine 时，它会运行垃圾收集的标记任务直到被抢占；【Idle：空转的】
 			case gcMarkWorkerIdleMode:
 				gcDrain(&_p_.gcw, gcDrainIdle|gcDrainUntilPreempt|gcDrainFlushBgCredit)
 			}
@@ -2015,6 +2156,7 @@ func gcBgMarkWorker(_p_ *p) {
 			_p_.gcBgMarkWorker.set(nil)
 			releasem(park.m.ptr())
 
+			// 当所有的后台工作任务都陷入等待并且没有剩余工作时，我们就认为该轮垃圾收集的标记阶段结束了，这时我们会调用 runtime.gcMarkDone 函数：
 			gcMarkDone()
 
 			// Disable preemption and prepare to reattach

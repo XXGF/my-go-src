@@ -761,10 +761,10 @@ type schedt struct {
 	// m.exited is set. Linked through m.freelink.
 	freem *m
 
-	gcwaiting  uint32 // gc is waiting to run
+	gcwaiting  uint32 // gc is waiting to run // GC调度器是否处于等待状态
 	stopwait   int32
 	stopnote   note
-	sysmonwait uint32
+	sysmonwait uint32  // GC系统监控是否处于等待状态
 	sysmonnote note
 
 	// safepointFn should be called on each P at the next GC

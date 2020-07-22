@@ -69,6 +69,7 @@ func gcMarkRootPrepare() {
 	work.nBSSRoots = 0
 
 	// Scan globals.
+	// 扫描全局变量
 	for _, datap := range activeModules() {
 		nDataRoots := nBlocks(datap.edata - datap.data)
 		if nDataRoots > work.nDataRoots {
@@ -484,7 +485,15 @@ func oldMarkrootSpans(gcw *gcWork, shard int) {
 // gp must be the calling user gorountine.
 //
 // This must be called with preemption enabled.
+// 每个 Goroutine 持有的 gcAssistBytes 表示当前协程辅助标记的字节数，
+// 全局垃圾收集控制器持有的 bgScanCredit 表示后台协程辅助标记的字节数，
+// 当本地 Goroutine 分配了较多的对象时，可以使用公用的信用 bgScanCredit 偿还。
+// 我们先来分析 runtime.gcAssistAlloc 函数的实现：
 func gcAssistAlloc(gp *g) {
+	// 该函数会先根据 Goroutine 的 gcAssistBytes 和垃圾收集控制器的配置计算需要完成的标记任务数量，
+	//如果全局信用 bgScanCredit 中有可用的点数，那么就会减去该点数，
+	//因为并发执行没有加锁，所以全局信用可能会被更新成负值，
+	//然而在长期来看这不是一个比较重要的问题。
 	// Don't assist in non-preemptible contexts. These are
 	// generally fragile and won't allow the assist to block.
 	if getg() == gp.m.g0 {
@@ -544,6 +553,8 @@ retry:
 
 	// Perform assist work
 	systemstack(func() {
+		// 如果全局信用不足以覆盖本地的债务，运行时会在系统栈中调用 runtime.gcAssistAlloc1 执行标记任务，
+		// 该函数会直接调用 runtime.gcDrainN 完成指定数量的标记任务并返回：
 		gcAssistAlloc1(gp, scanWork)
 		// The user stack may have moved, so this can't touch
 		// anything on it until it returns from systemstack.
@@ -552,6 +563,8 @@ retry:
 	completed := gp.param != nil
 	gp.param = nil
 	if completed {
+		// 当所有处理器的本地任务都完成并且不存在剩余的工作 Goroutine 时，
+		// 后台并发任务或者辅助标记的用户程序会调用 runtime.gcMarkDone 通知垃圾收集器。
 		gcMarkDone()
 	}
 
@@ -577,6 +590,9 @@ retry:
 		// there wasn't enough work to do anyway, so we might
 		// as well let background marking take care of the
 		// work that is available.
+		// 如果在完成标记辅助任务后，当前 Goroutine 仍然入不敷出并且 Goroutine 没有被抢占，
+		// 那么运行时会执行 runtime.gcParkAssist；在该函数中，
+		// 如果全局信用依然不足，runtime.gcParkAssist 会将当前 Goroutine 陷入休眠、加入全局的辅助标记队列并等待后台标记任务的唤醒。
 		if !gcParkAssist() {
 			goto retry
 		}
@@ -725,7 +741,11 @@ func gcParkAssist() bool {
 // Write barriers are disallowed because this is used by gcDrain after
 // it has ensured that all work is drained and this must preserve that
 // condition.
-//
+
+// 用于还债的 runtime.gcFlushBgCredit 实现比较简单，如果辅助队列中不存在等待的 Goroutine，
+// 那么当前的信用会直接加到全局信用 bgScanCredit 中：
+// 如果辅助队列不为空，上述函数会根据每个 Goroutine 的债务数量和已完成的工作决定是否唤醒这些陷入休眠的 Goroutine；
+// 如果唤醒所有的 Goroutine 后，标记任务量仍然有剩余，这些标记任务都会加入全局信用中。
 //go:nowritebarrierrec
 func gcFlushBgCredit(scanWork int64) {
 	if work.assistQueue.q.empty() {
@@ -1071,6 +1091,15 @@ const (
 //
 // gcDrain will always return if there is a pending STW.
 //
+// runtime.gcDrain 是用于扫描和标记堆内存中对象的核心方法，除了该方法之外，我们还会介绍工作池、写屏障以及标记辅助的实现原理。
+// 在调用 runtime.gcDrain 函数时，运行时会传入处理器上的 runtime.gcWork，
+// 这个结构体是垃圾收集器中工作池的抽象，它实现了一个生产者和消费者的模型，我们可以以该结构体为起点从整体理解标记工作：
+//
+// 用户程序辅助标记的核心目的就是避免用户程序分配内存影响垃圾收集器完成标记工作的期望时间，
+// 它通过维护账户体系保证用户程序不会对垃圾收集造成过多的负担，
+// 一旦用户程序分配了大量的内存，该用户程序就会通过辅助标记的方式平衡账本，
+// 这个过程会在最后达到相对平衡，保证标记任务在到达期望堆大小时完成。
+//
 //go:nowritebarrier
 func gcDrain(gcw *gcWork, flags gcDrainFlags) {
 	if !writeBarrier.needed {
@@ -1105,6 +1134,8 @@ func gcDrain(gcw *gcWork, flags gcDrainFlags) {
 			if job >= work.markrootJobs {
 				break
 			}
+			// 扫描根对象需要使用 runtime.markroot 函数，该函数会扫描缓存、数据段、存放全局变量和静态变量的 BSS 段以及 Goroutine 的栈内存；
+			// 一旦完成了对根对象的扫描，当前 Goroutine 会开始从本地和全局的工作缓存池中获取待执行的任务：
 			markroot(gcw, job)
 			if check != nil && check() {
 				goto done
@@ -1121,6 +1152,7 @@ func gcDrain(gcw *gcWork, flags gcDrainFlags) {
 		// worst case, we'll do O(log(_WorkbufSize)) unnecessary
 		// balances.
 		if work.full == 0 {
+			// runtime.gcWork.balance 方法会将处理器本地一部分工作放回全局队列中，让其他的处理器处理，保证不同处理器负载的平衡。
 			gcw.balance()
 		}
 
@@ -1233,6 +1265,8 @@ func gcDrainN(gcw *gcWork, scanWork int64) int64 {
 			// No heap or root jobs.
 			break
 		}
+		// 扫描对象会使用 runtime.scanobject，该函数会从传入的位置开始扫描，
+		// 扫描期间会调用 runtime.greyobject 为找到的活跃对象上色。
 		scanobject(b, gcw)
 
 		// Flush background scan work credit.

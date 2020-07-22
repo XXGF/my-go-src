@@ -345,6 +345,9 @@ func bool2int(x bool) int {
 func abort()
 
 // Called from compiled code; declared for vet; do NOT call from Go.
+// 写屏障是保证 Go 语言并发标记安全不可获取的技术，我们需要使用混合写屏障维护对象图的弱三色不变性，
+// 然而写屏障的实现需要编译器和运行时的共同协作。
+// 在 SSA 中间代码生成阶段，编译器会使用 cmd/compile/internal/ssa.writebarrier 函数在 Store、Move 和 Zero 操作中加入写屏障
 func gcWriteBarrier()
 func duffzero()
 func duffcopy()

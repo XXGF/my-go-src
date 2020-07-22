@@ -59,6 +59,7 @@ func init() {
 // the garbage collector from transitioning to mark termination since
 // gcWork may locally hold GC work buffers. This can be done by
 // disabling preemption (systemstack or acquirem).
+// 这个结构体是垃圾收集器中工作池的抽象，它实现了一个生产者和消费者的模型
 type gcWork struct {
 	// wbuf1 and wbuf2 are the primary and secondary work buffers.
 	//
@@ -78,6 +79,9 @@ type gcWork struct {
 	// next.
 	//
 	// Invariant: Both wbuf1 and wbuf2 are nil or neither are.
+	// 当我们向该结构体中增加或者删除对象时，它总会先操作主缓冲区，
+	//一旦主缓冲区空间不足或者没有对象，就会触发主备缓冲区的切换；
+	//而当两个缓冲区空间都不足或者都为空时，会从全局的工作缓冲区中插入或者获取对象，该结构体相关方法的实现都非常简单，这里就不展开分析了。
 	wbuf1, wbuf2 *workbuf
 
 	// Bytes marked (blackened) on this gcWork. This is aggregated

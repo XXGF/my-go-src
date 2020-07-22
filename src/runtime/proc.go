@@ -132,6 +132,7 @@ func main() {
 
 	if GOARCH != "wasm" { // no threads on wasm yet, so no sysmon
 		systemstack(func() {
+			// GC的关键组件2：启动系统监控
 			newm(sysmon, nil)
 		})
 	}
@@ -148,6 +149,7 @@ func main() {
 		throw("runtime.main not on m0")
 	}
 
+	// 执行 runtime.init
 	doInit(&runtime_inittask) // must be before defer
 	if nanotime() == 0 {
 		throw("nanotime returning zero")
@@ -164,6 +166,7 @@ func main() {
 	// Record when the world started.
 	runtimeInitTime = nanotime()
 
+	// GC的关键组件3：启动垃圾回收器后台
 	gcenable()
 
 	main_init_done = make(chan bool)
@@ -188,6 +191,7 @@ func main() {
 		cgocall(_cgo_notify_runtime_init_done, nil)
 	}
 
+	// 用户代码 main.init 和 main.main 入口
 	doInit(&main_inittask)
 
 	close(main_init_done)
@@ -240,10 +244,16 @@ func os_beforeExit() {
 
 // start forcegc helper goroutine
 func init() {
+	// 运行时会在应用程序启动时在后台开启一个用于强制触发垃圾收集的 Goroutine，
+	// 该 Goroutine 的职责非常简单 — 调用 runtime.gcStart 方法尝试启动新一轮的垃圾收集
 	go forcegchelper()
 }
 
+// GC关键组件2： GC 的 forcegc 开始被初始化
+// 为了减少对计算资源的占用，该 Goroutine 会在循环中调用 runtime.goparkunlock 主动陷入休眠等待其他 Goroutine 的唤醒，
+// runtime.forcegchelper 在大多数时间都是陷入休眠的，但是它会被系统监控器 runtime.sysmon 在满足垃圾收集条件时唤醒：
 func forcegchelper() {
+	// 指定 forcegc 的 goroutine
 	forcegc.g = getg()
 	lockInit(&forcegc.lock, lockRankForcegc)
 	for {
@@ -251,6 +261,7 @@ func forcegchelper() {
 		if forcegc.idle != 0 {
 			throw("forcegc: phase error")
 		}
+		// 将 forcegc 设置为空闲状态，并进入休眠
 		atomic.Store(&forcegc.idle, 1)
 		goparkunlock(&forcegc.lock, waitReasonForceGCIdle, traceEvGoBlock, 1)
 		// this goroutine is explicitly resumed by sysmon
@@ -258,6 +269,7 @@ func forcegchelper() {
 			println("GC forced")
 		}
 		// Time-triggered, fully concurrent.
+		// 当 forcegc.g 被唤醒时，开始从此处进行调度完全并发
 		gcStart(gcTrigger{kind: gcTriggerTime, now: nanotime()})
 	}
 }
@@ -575,6 +587,7 @@ func schedinit() {
 	goargs()
 	goenvs()
 	parsedebugvars()
+	// GC初始化
 	gcinit()
 
 	sched.lastpoll = uint64(nanotime())
@@ -926,6 +939,7 @@ func startTheWorldGC() {
 }
 
 // Holding worldsema grants an M the right to try to stop the world.
+// 是全局的信号量，获取该信号量的线程有权利暂停当前应用程序；
 var worldsema uint32 = 1
 
 // Holding gcsema grants the M the right to block a GC, and blocks
@@ -958,6 +972,14 @@ var gcsema uint32 = 1
 // startTheWorldWithSema and stopTheWorldWithSema.
 // Holding worldsema causes any other goroutines invoking
 // stopTheWorld to block.
+
+// STW 要确保所有被调度器调度执行的用户代码停止执行，
+// 一个可行的方案就是让所有的 M 与其关联的 P 解除绑定， 这样 M 便无法再继续执行用户代码了。
+// STW开始的逻辑
+// 1.尝试为每个处于运行状态 (_Prunning) 的 P 上的 goroutine 设置抢占标记，这样所有正在运行的 G 在发生进一步函数调用时，会主动被抢占
+// 2.抢占所有正在进行系统调用状态（_Psyscall）时还来不及被抢夺的 P
+// 3.抢占所有处于空闲状态尚未被 M 绑定的 P
+// 4.等待所有的P都与M成功解绑
 func stopTheWorldWithSema() {
 	_g_ := getg()
 
@@ -968,13 +990,18 @@ func stopTheWorldWithSema() {
 	}
 
 	lock(&sched.lock)
+	// 停止调度器需要停止的线程数
 	sched.stopwait = gomaxprocs
+	// 设置因 GC 需要停止调度器的标志位
 	atomic.Store(&sched.gcwaiting, 1)
+	// 抢占所有当前执行的 G
 	preemptall()
 	// stop current P
+	// 停止当前 G 所在的的 P，这时需要解绑的数量少了一个
 	_g_.m.p.ptr().status = _Pgcstop // Pgcstop is only diagnostic.
 	sched.stopwait--
 	// try to retake all P's in Psyscall status
+	// 抢占所有在系统调用 Psyscall 状态的 P
 	for _, p := range allp {
 		s := p.status
 		if s == _Psyscall && atomic.Cas(&p.status, s, _Pgcstop) {
@@ -987,6 +1014,7 @@ func stopTheWorldWithSema() {
 		}
 	}
 	// stop idle P's
+	// 抢占所有空闲的 P，防止再次被抢走
 	for {
 		p := pidleget()
 		if p == nil {
@@ -999,9 +1027,11 @@ func stopTheWorldWithSema() {
 	unlock(&sched.lock)
 
 	// wait for remaining P's to stop voluntarily
+	// 等待剩余的无法被抢占的 P 主动停止
 	if wait {
 		for {
 			// wait for 100us, then try to re-preempt in case of any races
+			// 等待 100 微秒，然后尝试重新抢占，从而防止竞争
 			if notetsleep(&sched.stopnote, 100*1000) {
 				noteclear(&sched.stopnote)
 				break
@@ -1034,6 +1064,11 @@ func stopTheWorldWithSema() {
 	}
 }
 
+// 当要结束STW阶段时，无非就是唤醒调度器，即唤醒已经处于休眠状态的M，重新开始调度G
+// STW结束的逻辑：
+// 1.网络数据优先级最高，优先确定需要处理的网络数据
+// 2.其次唤醒系统监控
+// 3.最后再依次唤醒 M，将其绑定 P，并重新开始调度 G
 func startTheWorldWithSema(emitTraceEvent bool) int64 {
 	mp := acquirem() // disable preemption because it can be holding p in a local var
 	if netpollinited() {
@@ -1042,19 +1077,24 @@ func startTheWorldWithSema(emitTraceEvent bool) int64 {
 	}
 	lock(&sched.lock)
 
+	// 处理器 P 的数量调整
 	procs := gomaxprocs
 	if newprocs != 0 {
 		procs = newprocs
 		newprocs = 0
 	}
 	p1 := procresize(procs)
+
+	// 调度器可以开始调度了
 	sched.gcwaiting = 0
+	// 唤醒系统监控
 	if sched.sysmonwait != 0 {
 		sched.sysmonwait = 0
 		notewakeup(&sched.sysmonnote)
 	}
 	unlock(&sched.lock)
 
+	// 依次将 m 唤醒，并绑定到 p，开始执行
 	for p1 != nil {
 		p := p1
 		p1 = p1.link.ptr()
@@ -1064,10 +1104,13 @@ func startTheWorldWithSema(emitTraceEvent bool) int64 {
 			if mp.nextp != 0 {
 				throw("startTheWorld: inconsistent mp->nextp")
 			}
+			// 将m绑定到p
 			mp.nextp.set(p)
+			// 将m唤醒
 			notewakeup(&mp.park)
 		} else {
 			// Start M to run P.  Do not start another M below.
+			// 运行 M 并运行 P. 下面不会创建一个新的 M
 			newm(nil, p)
 		}
 	}
@@ -1081,6 +1124,9 @@ func startTheWorldWithSema(emitTraceEvent bool) int64 {
 	// Wakeup an additional proc in case we have excessive runnable goroutines
 	// in local queues or in the global queue. If we don't, the proc will park itself.
 	// If we have lots of excessive work, resetspinning will unpark additional procs as necessary.
+	// 如果我们在本地队列或全局队列中有过多的可运行的 goroutine，则唤醒一个额外的 proc。
+	// 如果我们不这样做，那么过程就会停止。
+	// 如果我们有大量过多的工作，重新设置将取消必要的额外过程。
 	wakep()
 
 	releasem(mp)
@@ -1343,6 +1389,7 @@ func forEachP(fn func(*p)) {
 	}
 
 	// Wait for remaining Ps to run fn.
+	// 等待剩余的
 	if wait {
 		for {
 			// Wait for 100us, then try to re-preempt in
@@ -4580,6 +4627,7 @@ func checkdead() {
 var forcegcperiod int64 = 2 * 60 * 1e9
 
 // Always runs without a P, so write barriers are not allowed.
+// 第一个GC关键组件，系统监控：
 //
 //go:nowritebarrierrec
 func sysmon() {
@@ -4591,6 +4639,9 @@ func sysmon() {
 	lasttrace := int64(0)
 	idle := 0 // how many cycles in succession we had not wokeup somebody
 	delay := uint32(0)
+
+	// 这个循环中，sched.gcwaiting 的初始值为 0，表示不需要进行垃圾回收；如果值为 1 则表明正在等待垃圾回收的完成，需要进入休眠状态。
+	// 因此在用户态代码开始时，会直接进入下一个条件。第二个条件需要检查 forcegc 这个全局变量
 	for {
 		if idle == 0 { // start with 20us sleep...
 			delay = 20
@@ -4686,11 +4737,16 @@ func sysmon() {
 			idle++
 		}
 		// check if we need to force a GC
+		// 检查是否需要强制GC
+		// forcegc 这个全局变量的初始值为 0，这时条件 atomic.Load(&forcegc.idle) != 0 为 false
 		if t := (gcTrigger{kind: gcTriggerTime, now: now}); t.test() && atomic.Load(&forcegc.idle) != 0 {
+			// 系统监控在每个循环中都会主动构建一个 runtime.gcTrigger 并检查垃圾收集的触发条件是否满足，
+			// 如果满足条件，系统监控会将 runtime.forcegc 状态中持有的 Goroutine 加入全局队列等待调度器的调度。
 			lock(&forcegc.lock)
 			forcegc.idle = 0
 			var list gList
 			list.push(forcegc.g)
+			// injectlist 会将 forcegc.g 强制加入调度器调度队列中，等待执行 GC 调度
 			injectglist(&list)
 			unlock(&forcegc.lock)
 		}
