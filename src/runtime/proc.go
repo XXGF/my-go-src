@@ -3508,6 +3508,11 @@ func malg(stacksize int32) *g {
 	if stacksize >= 0 {
 		stacksize = round2(_StackSystem + stacksize)
 		systemstack(func() {
+			// 调用 runtime.stackalloc 分配一个大小足够栈内存空间，
+			// 根据线程缓存和申请栈的大小，该函数会通过三种不同的方法分配栈空间
+			// 1.如果栈空间较小，使用全局栈缓存或者线程缓存上固定大小的空闲链表分配内存；
+			// 2.如果栈空间较大，从全局的大栈缓存 runtime.stackLarge 中获取内存空间；
+			// 3.如果栈空间较大并且 runtime.stackLarge 空间不足，在堆上申请一片大小足够内存空间；
 			newg.stack = stackalloc(uint32(stacksize))
 		})
 		newg.stackguard0 = newg.stack.lo + _StackGuard

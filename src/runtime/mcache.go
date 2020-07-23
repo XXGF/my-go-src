@@ -54,7 +54,7 @@ type mcache struct {
 	// 每一个线程缓存都持有 67 * 2 个 runtime.mspan，这些内存管理单元都存储在结构体的 alloc 字段中：
 	alloc [numSpanClasses]*mspan // spans to allocate from, indexed by spanClass  // 用来分配的 spans，由 spanClass 索引
 
-	stackcache [_NumStackOrders]stackfreelist
+	stackcache [_NumStackOrders]stackfreelist    // 栈内存由于与线程关系比较密切，所以我们在每一个线程缓存 runtime.mcache 中都加入了栈缓存减少锁竞争影响。
 
 	// Local allocator stats, flushed during GC.
 	// 本地分配器统计，在 GC 期间被刷新

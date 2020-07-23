@@ -138,6 +138,7 @@ const (
 // Stacks are assigned an order according to size.
 //     order = log_2(size/FixedStack)
 // There is a free list for each order.
+// 全局栈缓存：分配小于32KB的栈空间
 var stackpool [_NumStackOrders]struct {
 	item stackpoolItem
 	_    [cpu.CacheLinePadSize - unsafe.Sizeof(stackpoolItem{})%cpu.CacheLinePadSize]byte
@@ -150,11 +151,18 @@ type stackpoolItem struct {
 }
 
 // Global pool of large stack spans.
+// 大栈缓存：分配大于32KB的栈空间
 var stackLarge struct {
 	lock mutex
 	free [heapAddrBits - pageShift]mSpanList // free lists by log_2(s.npages)
 }
 
+// 这两个用于分配空间的全局变量都与内存管理单元 runtime.mspan 有关，
+// 我们可以认为 Go 语言的栈内存都是分配在堆上的，
+// 运行时初始化时调用的 runtime.stackinit 函数会在初始化这些全局变量
+
+// 运行时使用全局的 runtime.stackpool 和线程缓存中的空闲链表分配 32KB 以下的栈内存，
+// 使用全局的 runtime.stackLarge 和堆内存分配 32KB 以上的栈内存，提高本地分配栈内存的性能。
 func stackinit() {
 	if _StackCacheSize&_PageMask != 0 {
 		throw("cache size must be a multiple of page size")
@@ -366,12 +374,16 @@ func stackalloc(n uint32) stack {
 			// Also don't touch stackcache during gc
 			// as it's flushed concurrently.
 			lock(&stackpool[order].item.mu)
+			// runtime.stackpoolalloc 函数会在全局的栈缓存池 runtime.stackpool 中获取新的内存，
+			// 如果栈缓存池中不包含剩余的内存，运行时会从堆上申请一片内存空间
 			x = stackpoolalloc(order)
 			unlock(&stackpool[order].item.mu)
 		} else {
 			c := thisg.m.p.ptr().mcache
+			// 如果线程缓存中包含足够的空间，我们可以从线程本地的缓存中获取内存，
 			x = c.stackcache[order].list
 			if x.ptr() == nil {
+				// 一旦发现空间不足就会调用 runtime.stackcacherefill 从堆上获取新的内存。
 				stackcacherefill(c, order)
 				x = c.stackcache[order].list
 			}
@@ -387,6 +399,8 @@ func stackalloc(n uint32) stack {
 		// Try to get a stack from the large stack cache.
 		lock(&stackLarge.lock)
 		if !stackLarge.free[log2npage].isEmpty() {
+			// 如果 Goroutine 申请的内存空间过大，运行时会查看 runtime.stackLarge 中是否有剩余的空间，
+			// 如果不存在剩余空间，它也会从堆上申请新的内存：
 			s = stackLarge.free[log2npage].first
 			stackLarge.free[log2npage].remove(s)
 		}

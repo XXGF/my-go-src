@@ -393,7 +393,9 @@ type wincallbackcontext struct {
 // The bounds of the stack are exactly [lo, hi),
 // with no implicit data structures on either side.
 type stack struct {
-	lo uintptr // 该协程拥有的栈地位
+	// 栈的顶部
+	lo uintptr // 该协程拥有的栈低位
+	// 栈的底部
 	hi uintptr // 该协程拥有的栈高位
 }
 
