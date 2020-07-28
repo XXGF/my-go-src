@@ -310,6 +310,7 @@ func setMNoWB(mp **m, new *m) {
 	(*muintptr)(unsafe.Pointer(mp)).set(new)
 }
 
+// 这些内容会在调度器保存或者恢复上下文的时候用到，其中的栈指针和程序计数器会用来存储或者恢复寄存器中的值，改变程序即将执行的代码。
 type gobuf struct {
 	// The offsets of sp, pc, and g are known to (hard-coded in) libmach.
 	//
@@ -323,11 +324,11 @@ type gobuf struct {
 	// and restores it doesn't need write barriers. It's still
 	// typed as a pointer so that any other writes from Go get
 	// write barriers.
-	sp   uintptr  // 栈指针位置
-	pc   uintptr  // 运行到的程序位置
-	g    guintptr
+	sp   uintptr  // 栈指针
+	pc   uintptr  // 程序计数器：运行到的程序位置
+	g    guintptr // 持有gobuf的Goroutine
 	ctxt unsafe.Pointer
-	ret  sys.Uintreg
+	ret  sys.Uintreg // 系统弄调用的返回值
 	lr   uintptr
 	bp   uintptr // for GOEXPERIMENT=framepointer
 }
@@ -407,7 +408,7 @@ type heldLockInfo struct {
 // go func() {}() 做了什么：
 // 1.new 一个 go的结构体，并把func的地址传到startfunc
 // 2.把 func的参数拷贝到栈里面
-// 3.把 创建的go结构体放入调度队列，等待调度
+// 3.把 创建的g结构体放入调度队列，等待调度
 type g struct {
 	// Stack parameters.
 	// stack describes the actual stack memory: [stack.lo, stack.hi).
@@ -416,18 +417,24 @@ type g struct {
 	// stackguard1 is the stack pointer compared in the C stack growth prologue.
 	// It is stack.lo+StackGuard on g0 and gsignal stacks.
 	// It is ~0 on other goroutine stacks, to trigger a call to morestackc (and crash).
+	// stack 字段描述了当前 Goroutine 的栈内存范围 [stack.lo, stack.hi)
 	stack       stack   // offset known to runtime/cgo    // go的协程实现是有栈协程，所以它有自己的栈
+	// stackguard0 可以用于调度器抢占式调度。
 	stackguard0 uintptr // offset known to liblink
 	stackguard1 uintptr // offset known to liblink
 
+	// 最内侧的 panic 结构体
 	_panic       *_panic // innermost panic - offset known to liblink
+	// 最内侧的延迟函数结构体
 	_defer       *_defer // innermost defer
+	// 当前Goroutine占用的线程，可能为空
 	m            *m      // current m; offset known to arm liblink
 	sched        gobuf   // 协程切换时保存的上下文信息
 	syscallsp    uintptr        // if status==Gsyscall, syscallsp = sched.sp to use during gc
 	syscallpc    uintptr        // if status==Gsyscall, syscallpc = sched.pc to use during gc
 	stktopsp     uintptr        // expected sp at top of stack, to check in traceback
 	param        unsafe.Pointer // passed parameter on wakeup
+	// Goroutine的状态
 	atomicstatus uint32
 	stackLock    uint32 // sigprof/scang lock; TODO: fold in to atomicstatus
 	goid         int64    // 协程id
@@ -435,8 +442,11 @@ type g struct {
 	waitsince    int64      // approx time when the g become blocked
 	waitreason   waitReason // if status==Gwaiting
 
+	// 抢占信号
 	preempt       bool // preemption signal, duplicates stackguard0 = stackpreempt
+	// 抢占时，将状态修改成 `_Gpreempted`
 	preemptStop   bool // transition to _Gpreempted on preemption; otherwise, just deschedule
+	// 在同步安全点收缩栈
 	preemptShrink bool // shrink stack at synchronous safe point
 
 	// asyncSafePoint is set if g is stopped at an asynchronous
@@ -487,6 +497,7 @@ type g struct {
 }
 
 type m struct {
+	// 持有调度栈的Goroutine
 	g0      *g     // goroutine with scheduling stack
 	morebuf gobuf  // gobuf arg to morestack
 	divmod  uint32 // div/mod denominator for arm - known to liblink
@@ -498,10 +509,14 @@ type m struct {
 	sigmask       sigset       // storage for saved signal mask
 	tls           [6]uintptr   // thread-local storage (for x86 extern register)
 	mstartfn      func()
+	// 在当前线程上运行的用户Goroutine
 	curg          *g       // current running goroutine
 	caughtsig     guintptr // goroutine running during fatal signal
+	// 正在运行代码的处理器
 	p             puintptr // attached p for executing go code (nil if not executing go code)
+	// 暂存的处理器
 	nextp         puintptr
+	// 执行系统调用之前的使用线程的处理器
 	oldp          puintptr // the p that was attached before executing a syscall
 	id            int64
 	mallocing     int32
