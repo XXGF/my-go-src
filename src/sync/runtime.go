@@ -52,6 +52,8 @@ func init() {
 func runtime_canSpin(i int) bool
 
 // runtime_doSpin does active spinning.
+// see src/runtime/proc.go:5327
+// 调用一定数量的pause指令 cpu不会执行任何操作 但是消耗cpu时间
 func runtime_doSpin()
 
 func runtime_nanotime() int64
