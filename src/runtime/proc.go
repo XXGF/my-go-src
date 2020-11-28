@@ -543,6 +543,7 @@ func cpuinit() {
 //	call runtime·mstart
 //
 // The new G calls runtime·main.
+// 运行时通过 runtime.schedinit 函数初始化调度器
 func schedinit() {
 	lockInit(&sched.lock, lockRankSched)
 	lockInit(&sched.sysmonlock, lockRankSysmon)
@@ -567,6 +568,8 @@ func schedinit() {
 		_g_.racectx, raceprocctx0 = raceinit()
 	}
 
+	// 在调度器初始函数执行的过程中会将 maxmcount 设置成 10000，这也就是一个 Go 语言程序能够创建的最大线程数，
+	// 虽然最多可以创建 10000 个线程，但是可以同时运行的线程还是由 GOMAXPROCS 变量控制。
 	sched.maxmcount = 10000
 
 	tracebackinit()
@@ -595,6 +598,8 @@ func schedinit() {
 	if n, ok := atoi32(gogetenv("GOMAXPROCS")); ok && n > 0 {
 		procs = n
 	}
+	// 从环境变量 GOMAXPROCS 获取了程序能够同时运行的最大处理器数之后就会调用 runtime.procresize 更新程序中处理器的数量
+	// 在这时整个程序不会执行任何用户 Goroutine，调度器也会进入锁定状态
 	if procresize(procs) != nil {
 		throw("unknown runnable goroutine during bootstrap")
 	}
@@ -2215,11 +2220,13 @@ top:
 	}
 
 	// local runq
+	// 1. 从本地队列取G
 	if gp, inheritTime := runqget(_p_); gp != nil {
 		return gp, inheritTime
 	}
 
 	// global runq
+	// 2. 从全局队列取G
 	if sched.runqsize != 0 {
 		lock(&sched.lock)
 		gp := globrunqget(_p_, 0)
@@ -2231,11 +2238,12 @@ top:
 
 	// Poll network.
 	// This netpoll is only an optimization before we resort to stealing.
-	// We can safely skip it if there are no waiters or a thread is blocked
-	// in netpoll already. If there is any kind of logical race with that
-	// blocked thread (e.g. it has already returned from netpoll, but does
-	// not set lastpoll yet), this thread will do blocking netpoll below
-	// anyway.
+	// We can safely skip it if there are no waiters or a thread is blocked in netpoll already.
+	// If there is any kind of logical race with that blocked thread (e.g. it has already returned from netpoll, but does not set lastpoll yet), this thread will do blocking netpoll below anyway.
+	// 此网络轮询只是在我们采取偷盗措施之前的一种优化。
+	// 如果没有等待的G或netpoll中的线程已阻塞，我们可以安全地跳过它。
+
+	// 3. 从网络轮询器中获取G
 	if netpollinited() && atomic.Load(&netpollWaiters) > 0 && atomic.Load64(&sched.lastpoll) != 0 {
 		if list := netpoll(0); !list.empty() { // non-blocking
 			gp := list.pop()
@@ -2271,6 +2279,7 @@ top:
 			if _p_ == p2 {
 				continue
 			}
+			// 从其他线程绑定的P中窃取G
 			if gp := runqsteal(_p_, p2, stealRunNextG); gp != nil {
 				return gp, false
 			}
@@ -2606,8 +2615,9 @@ func injectglist(glist *gList) {
 
 // One round of scheduler: find a runnable goroutine and execute it.
 // Never returns.
+// XGF Go调度器的逻辑
 func schedule() {
-	// 这里获取到的G永远是g0
+	// 1. 这里获取到的G永远是g0
 	_g_ := getg()
 
 	if _g_.m.locks != 0 {
@@ -2619,8 +2629,8 @@ func schedule() {
 		execute(_g_.m.lockedg.ptr(), false) // Never returns.
 	}
 
-	// We should not schedule away from a g that is executing a cgo call,
-	// since the cgo call is using the m's g0 stack.
+	// We should not schedule away from a g that is executing a cgo call, since the cgo call is using the m's g0 stack.
+	// 我们不应该将正在执行cgo调用的g安排在某个地方，因为cgo调用正在使用m的g0堆栈。
 	if _g_.m.incgo {
 		throw("schedule: in cgo")
 	}
@@ -2629,6 +2639,7 @@ top:
 	pp := _g_.m.p.ptr()
 	pp.preempt = false
 
+	// 2. 如果处于GC阶段，停止当前M
 	if sched.gcwaiting != 0 {
 		gcstopm()
 		goto top
@@ -2646,6 +2657,7 @@ top:
 
 	checkTimers(pp, 0)
 
+	// 下一个G
 	var gp *g
 	var inheritTime bool
 
@@ -2681,6 +2693,10 @@ top:
 		// if checkTimers added a local goroutine via goready.
 	}
 	if gp == nil {
+		// 3. 取下一个处于可运行状态的G
+		// 3.1 从本地队列取
+		// 3.2 从全局队列取
+		// 3.3 从其他线程中窃取
 		gp, inheritTime = findrunnable() // blocks until work is available
 	}
 
@@ -2720,6 +2736,7 @@ top:
 		goto top
 	}
 
+	// 4. 调用 runtime.execute 函数在当前线程 M 上运行 G
 	execute(gp, inheritTime)
 }
 
@@ -3539,11 +3556,17 @@ func malg(stacksize int32) *g {
 // untyped arguments in newproc's argument frame. Stack copies won't
 // be able to adjust them and stack splits won't be able to copy them.
 //
+// 编译器会将所有的go关键字转换成 这个 函数
+// 该函数会接收大小和表示函数的指针 funcval。
+// 在这个函数中我们还会获取 Goroutine 以及调用方的程序计数器，然后调用 runtime.newproc1 函数：
 //go:nosplit
 func newproc(siz int32, fn *funcval) {
 	argp := add(unsafe.Pointer(&fn), sys.PtrSize)
+	// 获取指向当前G的指针
 	gp := getg()
+	// 获取调用方的程序计数器
 	pc := getcallerpc()
+	// 将传进来的函数运行在系统栈
 	systemstack(func() {
 		newg := newproc1(fn, argp, siz, gp, pc)
 
@@ -4333,6 +4356,14 @@ func (pp *p) destroy() {
 // gcworkbufs are not being modified by either the GC or
 // the write barrier code.
 // Returns list of Ps with local work, they need to be scheduled by the caller.
+// 1. 如果全局变量 allp 切片中的处理器数量少于期望数量，就会对切片进行扩容；
+// 2. 使用 new 创建新的处理器结构体并调用 runtime.p.init 方法初始化刚刚扩容的处理器；
+// 3. 通过指针将线程 m0 和处理器 allp[0] 绑定到一起；
+// 4. 调用 runtime.p.destroy 方法释放不再使用的处理器结构；
+// 5. 通过截断改变全局变量 allp 的长度保证与期望处理器数量相等；
+// 6. 将除 allp[0] 之外的处理器 P 全部设置成 _Pidle 并加入到全局的空闲队列中；
+// 调用 runtime.procresize 就是调度器启动的最后一步，在这一步过后调度器会完成相应数量处理器的启动，
+// 等待用户创建运行新的 Goroutine 并为 Goroutine 调度处理器资源。
 func procresize(nprocs int32) *p {
 	old := gomaxprocs
 	if old < 0 || nprocs <= 0 {
@@ -4350,6 +4381,8 @@ func procresize(nprocs int32) *p {
 	sched.procresizetime = now
 
 	// Grow allp if necessary.
+	// 1. 如果全局变量 allp 切片中的处理器数量少于期望数量，就会对切片进行扩容；
+	// nprocs 就是期望数量
 	if nprocs > int32(len(allp)) {
 		// Synchronize with retake, which could be running
 		// concurrently since it doesn't run on a P.
@@ -4366,8 +4399,10 @@ func procresize(nprocs int32) *p {
 		unlock(&allpLock)
 	}
 
-	// initialize new P's
 	// 初始化新的P
+	// initialize new P's
+
+	// 2. 使用 new 创建新的处理器结构体并调用 runtime.p.init 方法初始化刚刚创建的处理器；
 	for i := old; i < nprocs; i++ {
 		pp := allp[i]
 		if pp == nil {
@@ -4399,6 +4434,7 @@ func procresize(nprocs int32) *p {
 			_g_.m.p.ptr().m = 0
 		}
 		_g_.m.p = 0
+		// 3. 通过指针将线程 m0 和处理器 allp[0] 绑定到一起；
 		p := allp[0]
 		p.m = 0
 		p.status = _Pidle
@@ -4412,6 +4448,7 @@ func procresize(nprocs int32) *p {
 	mcache0 = nil
 
 	// release resources from unused P's
+	// 4. 调用 runtime.p.destroy 方法释放不再使用的处理器结构；
 	for i := nprocs; i < old; i++ {
 		p := allp[i]
 		p.destroy()
@@ -4419,20 +4456,24 @@ func procresize(nprocs int32) *p {
 	}
 
 	// Trim allp.
+	// 5. 通过截断改变全局变量 allp 的长度保证与期望处理器数量相等；
 	if int32(len(allp)) != nprocs {
 		lock(&allpLock)
 		allp = allp[:nprocs]
 		unlock(&allpLock)
 	}
 
+	// 6. 将除 allp[0] 之外的处理器 P 全部设置成 _Pidle 并加入到全局的空闲队列中；
 	var runnablePs *p
 	for i := nprocs - 1; i >= 0; i-- {
 		p := allp[i]
 		if _g_.m.p.ptr() == p {
 			continue
 		}
+		// XGF: 把 运行队列为空的 P，放到空闲P列表
 		p.status = _Pidle
 		if runqempty(p) {
+			// 放到空闲队列
 			pidleput(p)
 		} else {
 			p.m.set(mget())
@@ -4737,6 +4778,7 @@ func sysmon() {
 		}
 		// retake P's blocked in syscalls
 		// and preempt long running G's
+		// 在系统监控中，如果一个 Goroutine 的运行时间超过 10ms，就会调用 runtime.retake，runtime.retake 会调用 runtime.preemptone；
 		if retake(now) != 0 {
 			idle = 0
 		} else {
@@ -4800,6 +4842,7 @@ func retake(now int64) uint32 {
 				pd.schedtick = uint32(t)
 				pd.schedwhen = now
 			} else if pd.schedwhen+forcePreemptNS <= now {
+				// 如果当前G的运行时间大于 10 ms，则会被标志位可抢占。
 				preemptone(_p_)
 				// In case of syscall, preemptone() doesn't
 				// work, because there is no M wired to P.
@@ -4849,6 +4892,9 @@ func retake(now int64) uint32 {
 // processor just started running it.
 // No locks need to be held.
 // Returns true if preemption request was issued to at least one goroutine.
+
+// 在 runtime.stoptheworld 中调用 runtime.preemptall 设置所有处理器上正在运行的 Goroutine 的 stackguard0 为 StackPreempt；
+// 在 runtime.newstack 函数中增加抢占的代码，当 stackguard0 等于 StackPreempt 时触发调度器抢占让出线程；
 func preemptall() bool {
 	res := false
 	for _, _p_ := range allp {
@@ -4863,15 +4909,19 @@ func preemptall() bool {
 }
 
 // Tell the goroutine running on processor P to stop.
-// This function is purely best-effort. It can incorrectly fail to inform the
-// goroutine. It can send inform the wrong goroutine. Even if it informs the
-// correct goroutine, that goroutine might ignore the request if it is
-// simultaneously executing newstack.
+// This function is purely best-effort. It can incorrectly fail to inform the goroutine.
+// It can send inform the wrong goroutine.
+// Even if it informs the correct goroutine, that goroutine might ignore the request if it is simultaneously executing newstack.
 // No lock needs to be held.
 // Returns true if preemption request was issued.
-// The actual preemption will happen at some point in the future
-// and will be indicated by the gp->status no longer being
-// Grunning
+// The actual preemption will happen at some point in the future and will be indicated by the gp->status no longer being Grunning
+// 告诉处理器P上运行的goroutine停止。
+// 此功能纯粹是尽力而为。它可能会错误地无法通知goroutine。
+// 它可以发送通知给错误的goroutine。
+// 即使它通知了正确的goroutine，该goroutine如果同时执行newstack也可能会忽略该请求。
+// 无需锁定。
+// 如果发出了抢占请求，则返回true。
+// 实际的抢占将在将来的某个时刻发生，并将通过gp-> status不再显示
 func preemptone(_p_ *p) bool {
 	mp := _p_.m.ptr()
 	if mp == nil || mp == getg().m {
@@ -4884,15 +4934,19 @@ func preemptone(_p_ *p) bool {
 
 	gp.preempt = true
 
-	// Every call in a go routine checks for stack overflow by
-	// comparing the current stack pointer to gp->stackguard0.
-	// Setting gp->stackguard0 to StackPreempt folds
-	// preemption into the normal stack overflow check.
+	// Every call in a go routine checks for stack overflow by comparing the current stack pointer to gp->stackguard0.
+	// go例程中的每个调用都通过将当前堆栈指针与gp-> stackguard0比较来检查堆栈溢出。
+	// Setting gp->stackguard0 to StackPreempt folds preemption into the normal stack overflow check.
+	// 将gp-> stackguard0设置为StackPreempt会将抢占折叠到正常的堆栈溢出检查中。
+
+	// XGF: 将当前G的stackguard0 设置为 stackPreempt，因为者当前G可以被抢占。
 	gp.stackguard0 = stackPreempt
 
 	// Request an async preemption of this P.
 	if preemptMSupported && debug.asyncpreemptoff == 0 {
+		// 设置preempt表示该P应该尽快进入调度程序（无论G正在运行什么）
 		_p_.preempt = true
+		// 调用 runtime.preemptM 触发抢占
 		preemptM(mp)
 	}
 

@@ -30,29 +30,31 @@ const (
 	// _Gscanwaiting -> _Gscanrunnable are actually okay because
 	// they don't affect stack ownership.
 
-	// _Gidle means this goroutine was just allocated and has not
-	// yet been initialized.
+	// 意味着此 go 例程刚刚分配， 尚未初始化。
+	// _Gidle means this goroutine was just allocated and has not yet been initialized.
 	_Gidle = iota // 0
 
-	// _Grunnable means this goroutine is on a run queue. It is
-	// not currently executing user code. The stack is not owned.
+	// 没有执行代码，没有栈的所有权，存储在运行队列中
+	// _Grunnable means this goroutine is on a run queue. It is not currently executing user code. The stack is not owned.
 	_Grunnable // 1
 
-	// _Grunning means this goroutine may execute user code. The
-	// stack is owned by this goroutine. It is not on a run queue.
-	// It is assigned an M and a P (g.m and g.m.p are valid).
+	// 可以执行代码，拥有栈的所有权，被赋予了内核线程 M 和处理器 P
+	// _Grunning means this goroutine may execute user code.
+	//The stack is owned by this goroutine. It is not on a run queue. It is assigned an M and a P (g.m and g.m.p are valid).
+	// 拥有协程栈，没有在运行队列中，被分配了 M 和 P
 	_Grunning // 2
 
+	// 正在执行系统调用，拥有栈的所有权，没有执行用户代码，被赋予了内核线程 M 但是不在运行队列上
 	// _Gsyscall means this goroutine is executing a system call.
-	// It is not executing user code. The stack is owned by this
-	// goroutine. It is not on a run queue. It is assigned an M.
+	// It is not executing user code. The stack is owned by this goroutine. It is not on a run queue. It is assigned an M.
+	// 没有在执行用户代码，没有拥有栈，没有在运行队列中，被分配了M
 	_Gsyscall // 3
 
+	// 由于运行时而被阻塞，没有执行用户代码并且不在运行队列上，但是可能存在于 Channel 的等待队列上
 	// _Gwaiting means this goroutine is blocked in the runtime.
-	// It is not executing user code. It is not on a run queue,
-	// but should be recorded somewhere (e.g., a channel wait
-	// queue) so it can be ready()d when necessary. The stack is
-	// not owned *except* that a channel operation may read or
+	// It is not executing user code. It is not on a run queue, but should be recorded somewhere (e.g., a channel wait queue) so it can be ready()d when necessary.
+	// 没有在执行用户代码，没有在运行队列，但是应该放在了其他地方。
+	//The stack is not owned *except* that a channel operation may read or
 	// write parts of the stack under the appropriate channel
 	// lock. Otherwise, it is not safe to access the stack after a
 	// goroutine enters _Gwaiting (e.g., it may get moved).
@@ -62,6 +64,7 @@ const (
 	// scripts.
 	_Gmoribund_unused // 5
 
+	// 没有被使用，没有执行代码，可能有分配的栈
 	// _Gdead means this goroutine is currently unused. It may be
 	// just exited, on a free list, or just being initialized. It
 	// is not executing user code. It may or may not have a stack
@@ -73,18 +76,21 @@ const (
 	// _Genqueue_unused is currently unused.
 	_Genqueue_unused // 7
 
-	// _Gcopystack means this goroutine's stack is being moved. It
-	// is not executing user code and is not on a run queue. The
-	// stack is owned by the goroutine that put it in _Gcopystack.
+	// 栈正在被拷贝，没有执行代码，不在运行队列上
+	// _Gcopystack means this goroutine's stack is being moved.
+	//It is not executing user code and is not on a run queue.
+	// 没有执行用户代码，也不在运行队列中。
+	//The stack is owned by the goroutine that put it in _Gcopystack.
+	// 栈将由 把当前G设置为 _Gcopystack 状态的 G拥有
 	_Gcopystack // 8
 
-	// _Gpreempted means this goroutine stopped itself for a
-	// suspendG preemption. It is like _Gwaiting, but nothing is
-	// yet responsible for ready()ing it. Some suspendG must CAS
-	// the status to _Gwaiting to take responsibility for
-	// ready()ing this G.
+	// 由于抢占而被阻塞，没有执行用户代码并且不在运行队列上，等待唤醒
+	// _Gpreempted means this goroutine stopped itself for a suspendG preemption.
+	// It is like _Gwaiting, but nothing is yet responsible for ready()ing it.
+	// Some suspendG must CAS the status to _Gwaiting to take responsibility for ready()ing this G.
 	_Gpreempted // 9
 
+	// GC 正在扫描栈空间，没有执行代码，可以与其他状态同时存在
 	// _Gscan combined with one of the above states other than
 	// _Grunning indicates that GC is scanning the stack. The
 	// goroutine is not executing user code and the stack is owned
@@ -97,6 +103,7 @@ const (
 	// atomicstatus&~Gscan gives the state the goroutine will
 	// return to when the scan completes.
 	_Gscan          = 0x1000
+
 	_Gscanrunnable  = _Gscan + _Grunnable  // 0x1001
 	_Gscanrunning   = _Gscan + _Grunning   // 0x1002
 	_Gscansyscall   = _Gscan + _Gsyscall   // 0x1003
@@ -107,6 +114,7 @@ const (
 const (
 	// P status
 
+	// 处理器没有运行用户代码或者调度器，被空闲队列或者改变其状态的结构持有，运行队列为空
 	// _Pidle means a P is not being used to run user code or the
 	// scheduler. Typically, it's on the idle P list and available
 	// to the scheduler, but it may just be transitioning between
@@ -116,6 +124,7 @@ const (
 	// transitioning its state. Its run queue is empty.
 	_Pidle = iota
 
+	// 被线程 M 持有，并且正在执行用户代码或者调度器
 	// _Prunning means a P is owned by an M and is being used to
 	// run user code or the scheduler. Only the M that owns this P
 	// is allowed to change the P's status from _Prunning. The M
@@ -125,6 +134,8 @@ const (
 	// off directly to another M (e.g., to schedule a locked G).
 	_Prunning
 
+
+	// 没有执行用户代码，当前线程陷入系统调用
 	// _Psyscall means a P is not running user code. It has
 	// affinity to an M in a syscall but is not owned by it and
 	// may be stolen by another M. This is similar to _Pidle but
@@ -137,6 +148,7 @@ const (
 	// used by another M in the interim.
 	_Psyscall
 
+	// 被线程 M 持有，当前处理器由于垃圾回收被停止
 	// _Pgcstop means a P is halted for STW and owned by the M
 	// that stopped the world. The M that stopped the world
 	// continues to use its P, even in _Pgcstop. Transitioning
@@ -147,6 +159,7 @@ const (
 	// the scheduler on Ps with non-empty run queues.
 	_Pgcstop
 
+	// 当前处理器已经不被使用
 	// _Pdead means a P is no longer used (GOMAXPROCS shrank). We
 	// reuse Ps if GOMAXPROCS increases. A dead P is mostly
 	// stripped of its resources, though a few things remain
@@ -310,7 +323,8 @@ func setMNoWB(mp **m, new *m) {
 	(*muintptr)(unsafe.Pointer(mp)).set(new)
 }
 
-// 这些内容会在调度器保存或者恢复上下文的时候用到，其中的栈指针和程序计数器会用来存储或者恢复寄存器中的值，改变程序即将执行的代码。
+// 这些内容会在调度器保存或者恢复上下文的时候用到，
+// 其中的栈指针和程序计数器会用来存储或者恢复寄存器中的值，改变程序即将执行的代码。
 type gobuf struct {
 	// The offsets of sp, pc, and g are known to (hard-coded in) libmach.
 	//
@@ -419,7 +433,8 @@ type g struct {
 	// It is ~0 on other goroutine stacks, to trigger a call to morestackc (and crash).
 	// stack 字段描述了当前 Goroutine 的栈内存范围 [stack.lo, stack.hi)
 	stack       stack   // offset known to runtime/cgo    // go的协程实现是有栈协程，所以它有自己的栈
-	// stackguard0 可以用于调度器抢占式调度。
+	// stackguard0 可以用于调度器的基于协作的抢占式调度。
+	// 该字段被设置成 StackPreempt 意味着当前 Goroutine 可以被抢占。
 	stackguard0 uintptr // offset known to liblink
 	stackguard1 uintptr // offset known to liblink
 
@@ -429,7 +444,7 @@ type g struct {
 	_defer       *_defer // innermost defer
 	// 当前Goroutine占用的线程，可能为空
 	m            *m      // current m; offset known to arm liblink
-	sched        gobuf   // 协程切换时保存的上下文信息
+	sched        gobuf   // 存储 Goroutine 的调度相关的数据, 协程切换时保存的上下文信息
 	syscallsp    uintptr        // if status==Gsyscall, syscallsp = sched.sp to use during gc
 	syscallpc    uintptr        // if status==Gsyscall, syscallpc = sched.pc to use during gc
 	stktopsp     uintptr        // expected sp at top of stack, to check in traceback
@@ -583,13 +598,14 @@ type m struct {
 	locksHeld    [10]heldLockInfo
 }
 
-// GMP中的管理groutine本地队列的上下文
+// P 是 GMP中的管理groutine本地队列的上下文
 // mcache 会被 P 持有，当 M 和 P 绑定时，M 同样会保留 mcache 的指针
 // mcache 直接向操作系统申请内存，且常驻运行时
 // P 通过 make 命令进行分配，会分配在 Go 堆上
 type p struct {
 	id          int32
 	status      uint32 // one of pidle/prunning/...
+	// 空闲P队列
 	link        puintptr
 	schedtick   uint32     // incremented on every scheduler call
 	syscalltick uint32     // incremented on every system call
@@ -710,8 +726,8 @@ type p struct {
 	// Race context used while executing timer functions.
 	timerRaceCtx uintptr
 
-	// preempt is set to indicate that this P should be enter the
-	// scheduler ASAP (regardless of what G is running on it).
+	// preempt is set to indicate that this P should be enter the scheduler ASAP (regardless of what G is running on it).
+	// 设置preempt表示该P应该尽快进入调度程序（无论G正在运行什么）。
 	preempt bool
 
 	pad cpu.CacheLinePad

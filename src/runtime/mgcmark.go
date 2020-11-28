@@ -235,6 +235,9 @@ func markroot(gcw *gcWork, i uint32) {
 			// we scan the stacks we can and ask running
 			// goroutines to scan themselves; and the
 			// second blocks.
+			// 0. 在触发垃圾回收的栈扫描时会调用 runtime.suspendG 挂起 Goroutine，该函数会执行下面的逻辑：
+			// 0.1 将 _Grunning 状态的 Goroutine 标记成可以被抢占，即将 preemptStop 设置成 true；
+			// 0.2 调用 runtime.preemptM 触发抢占；
 			stopped := suspendG(gp)
 			if stopped.dead {
 				gp.gcscandone = true

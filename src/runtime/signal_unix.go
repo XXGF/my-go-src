@@ -340,12 +340,18 @@ func doSigPreempt(gp *g, ctxt *sigctxt) {
 
 const preemptMSupported = true
 
-// preemptM sends a preemption request to mp. This request may be
-// handled asynchronously and may be coalesced with other requests to
-// the M. When the request is received, if the running G or P are
-// marked for preemption and the goroutine is at an asynchronous
-// safe-point, it will preempt the goroutine. It always atomically
-// increments mp.preemptGen after handling a preemption request.
+// preemptM sends a preemption request to mp.
+// This request may be handled asynchronously and may be coalesced with other requests to the M.
+// When the request is received, if the running G or P are marked for preemption and the goroutine is at an asynchronous safe-point, it will preempt the goroutine.
+// It always atomically increments mp.preemptGen after handling a preemption request.
+// preemptM向mp发送抢占请求
+// 该请求可以异步处理，并且可以与对M的其他请求合并。
+// 收到请求后，如果正在运行的G或P被标记为抢占，并且goroutine处于异步安全点，它将抢占goroutine。
+// 在处理抢占请求后，它总是以原子方式递增mp.preemptGen。
+
+// 0. 在触发垃圾回收的栈扫描时会调用 runtime.suspendG 挂起 Goroutine，该函数会执行下面的逻辑：
+// 0.1 将 _Grunning 状态的 Goroutine 标记成可以被抢占，即将 preemptStop 设置成 true；
+// 0.2 调用 runtime.preemptM 触发抢占；
 func preemptM(mp *m) {
 	if GOOS == "darwin" && GOARCH == "arm64" && !iscgo {
 		// On darwin, we use libc calls, and cgo is required on ARM64
@@ -358,11 +364,17 @@ func preemptM(mp *m) {
 		return
 	}
 	if atomic.Cas(&mp.signalPending, 0, 1) {
-		// If multiple threads are preempting the same M, it may send many
-		// signals to the same M such that it hardly make progress, causing
-		// live-lock problem. Apparently this could happen on darwin. See
-		// issue #37741.
+		// If multiple threads are preempting the same M, it may send many signals to the same M such that it hardly make progress, causing live-lock problem.
+		// Apparently this could happen on darwin.
+		// See issue #37741.
 		// Only send a signal if there isn't already one pending.
+		// 1. runtime.signalM 向线程发送信号 SIGURG；
+		// 2. 操作系统会中断正在运行的线程并执行预先注册的信号处理函数 runtime.doSigPreempt； 【程序启动时，在 runtime.sighandler 函数中注册 SIGURG 信号的处理函数 runtime.doSigPreempt；】
+		// 3. runtime.doSigPreempt 函数会处理抢占信号，获取当前的 SP 和 PC 寄存器并调用 runtime.sigctxt.pushCall；
+		// 4. runtime.sigctxt.pushCall 会修改寄存器并在程序回到用户态时执行 runtime.asyncPreempt；
+		// 5. 汇编指令 runtime.asyncPreempt 会调用运行时函数 runtime.asyncPreempt2；
+		// 6. runtime.asyncPreempt2 会调用 runtime.preemptPark；
+		// 7. runtime.preemptPark 会修改当前 Goroutine 的状态到 _Gpreempted 并调用 runtime.schedule 让当前函数陷入休眠并让出线程，调度器会选择其它的 Goroutine 继续执行；
 		signalM(mp, sigPreempt)
 	}
 }
@@ -536,6 +548,7 @@ func sighandler(sig uint32, info *siginfo, ctxt unsafe.Pointer, gp *g) {
 		return
 	}
 
+	// 程序启动时，在 runtime.sighandler 函数中注册 SIGURG 信号的处理函数 runtime.doSigPreempt ???
 	if sig == sigPreempt && debug.asyncpreemptoff == 0 {
 		// Might be a preemption signal.
 		doSigPreempt(gp, c)
