@@ -407,7 +407,7 @@ type mspan struct {
 	prev *mspan     // previous span in list, or nil if none                 // 链表中的前一个 span，如果为空则为 nil
 	list *mSpanList // For debugging. TODO: Remove.
 
-	// 起始地址，也即所管理页的地址
+	// 起始地址，也即所管理页的起始地址
 	startAddr uintptr // address of first byte of span aka s.base()          // span 的第一个字节的地址，即 s.base()，即它管理的内存页的起始地址
 	// 管理的页数
 	npages    uintptr // number of pages in span                             // 一个 span 中的 page 数量
