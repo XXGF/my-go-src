@@ -94,7 +94,7 @@ func (m *Mutex) Lock() {
 func (m *Mutex) lockSlow() {
 	// 当前G在队列中的等待时间
 	var waitStartTime int64
-	// 当前G是否处于饥饿装填
+	// 当前G是否处于饥饿状态
 	starving := false
 	// 当前G是否被唤醒
 	awoke := false
@@ -182,7 +182,7 @@ func (m *Mutex) lockSlow() {
 			new &^= mutexWoken
 		}
 
-		// 3 实现上面提到的尝试
+		// 3 实现上面提到的尝试，尝试争抢锁
 		if atomic.CompareAndSwapInt32(&m.state, old, new) {
 			// TODO 加锁成功
 			// 3.1 如果Mutex，原本即不处于加锁状态，也不处于饥饿状态，则这里意味着加锁成功，跳出循环
@@ -240,7 +240,7 @@ func (m *Mutex) lockSlow() {
 				break
 			}
 
-			// 3.7 等待队列中的G，被唤醒后加锁不成功。如果当前锁状态又不处于饥饿状态，则当前G继续尝试自旋
+			// 3.7 等待队列中的G，被唤醒后加锁不成功。如果当前锁状态又不处于饥饿状态，则当前G继续尝试自旋，以及和新来的G争抢锁
 			// 3.7.1 将当前G设置为唤醒状态
 			awoke = true
 			// 3.7.2 重置当前G的自旋次数
@@ -273,10 +273,10 @@ func (m *Mutex) Unlock() {
 	if new != 0 {
 		// Outlined slow path to allow inlining the fast path.
 		// To hide unlockSlow during tracing we skip one extra frame when tracing GoUnblock.
-		// 2. 解锁失败
+		// 2. 解锁成功，但是还有事要处理
 		m.unlockSlow(new)
 	}
-	// 1. state == 0，说明等待队列中没有G在等待，且Mutex原来即不处于饥饿状态，也不处于唤醒状态，而仅仅处于锁定状态，直接返回。【即没有G在等待这个锁，也没有G刚好进来要获取锁】
+	// 1. new state == 0，说明等待队列中没有G在等待，且Mutex原来即不处于饥饿状态，也不处于唤醒状态，而仅仅处于锁定状态，直接返回。【即没有G在等待这个锁，也没有G刚好进来要获取锁】
 }
 
 func (m *Mutex) unlockSlow(new int32) {
@@ -287,7 +287,7 @@ func (m *Mutex) unlockSlow(new int32) {
 	if new&mutexStarving == 0 {
 		old := new
 		for {
-			// 1.1  如果没有等待的G 或者 Mutex已经被唤醒，不需要叫醒任何等待G。【对应的是解锁的自旋G会将Mutex设置为唤醒状态】
+			// 1.1  如果没有等待的G 或者 Mutex已经被唤醒，不需要叫醒任何等待G。【对应的是加锁的自旋G会将Mutex设置为唤醒状态】
 			// 在饥饿模式下，所有权直接从解锁goroutine传递给下一个等待者。
 			// 我们不是这个链条的一部分，因为当我们解锁上面的互斥锁时，我们没有观察到mutexStarving。 所以下车吧。
 			// If there are no waiters or a goroutine has already been woken or grabbed the lock, no need to wake anyone.
@@ -297,10 +297,12 @@ func (m *Mutex) unlockSlow(new int32) {
 			if old>>mutexWaiterShift == 0 || old&(mutexLocked|mutexWoken|mutexStarving) != 0 {
 				return
 			}
+
 			// 抓住权利，唤醒某个G
 			// Grab the right to wake someone.
-			// 1.2 将Mutex设置为唤醒状态，同事将等待队列的数量 -1
+			// 1.2 将Mutex设置为唤醒状态，同时将等待队列的数量 -1，准备对等待队列中的第一个G进行唤醒
 			new = (old - 1<<mutexWaiterShift) | mutexWoken
+
 			// 1.3 更新1.2的设置，并通过 sync.runtime_Semrelease 唤醒等待者并移交锁的所有权；
 			// runtime_Semrelease 和 runtime_SemacquireMutex 对应
 			if atomic.CompareAndSwapInt32(&m.state, old, new) {
@@ -308,6 +310,8 @@ func (m *Mutex) unlockSlow(new int32) {
 				runtime_Semrelease(&m.sema, false, 1)
 				return
 			}
+
+			// 如果上面的处理都没成功，则重新获取Mutex的state，重新进行上面的处理，直至成功。
 			old = m.state
 		}
 	} else {
@@ -317,6 +321,7 @@ func (m *Mutex) unlockSlow(new int32) {
 		// 注意：未设置mutexLocked，唤醒G将在唤醒后设置它。
 		// 但是如果设置了mutexStarving，仍然认为互斥锁是锁定的，
 		// 所以新来的G不会获得它。
+		// 本质上就是，新来的G执行CAS之后，是没有成功获取锁的，且它会被放到等待队列中。
 		// Starving mode: handoff mutex ownership to the next waiter, and yield our time slice so that the next waiter can start to run immediately.
 		// Note: mutexLocked is not set, the waiter will set it after wakeup.
 		// But mutex is still considered locked if mutexStarving is set,
