@@ -26,9 +26,11 @@ const (
 // Known to compiler.
 // Changes here must also be made in src/cmd/internal/gc/select.go's scasetype.
 type scase struct {
+	// c 表示这个 case 对应的通道
 	c           *hchan         // chan
+	// elem 表示接收数据的地址或者要发送的数据的地址
 	elem        unsafe.Pointer // data element
-	kind        uint16
+	kind        uint16         // case 的类型，caseRecv 和 caseSend 分别表示接收和发送的 case。caseDefault 对应 default 分支。
 	pc          uintptr // race pc (for race detector / msan)
 	releasetime int64
 }
@@ -116,6 +118,8 @@ func block() {
 // ordinal position of its respective select{recv,send,default} call.
 // Also, if the chosen scase was a receive operation, it reports whether
 // a value was received.
+// 它的第一个返回值表示需要执行哪个 case, 第 2 个返回值表示如果要执行的 case 是 caseRecv，那么接收数据是否成功
+// 每个 scase 表示一个 case 分支
 func selectgo(cas0 *scase, order0 *uint16, ncases int) (int, bool) {
 	if debugSelect {
 		print("select: cas0=", cas0, "\n")

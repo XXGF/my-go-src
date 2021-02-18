@@ -362,6 +362,7 @@ type sudog struct {
 	// channel this sudog is blocking on. shrinkstack depends on
 	// this for sudogs involved in channel ops.
 
+	// 操作channel的G
 	g *g
 
 	next *sudog

@@ -30,16 +30,19 @@ const (
 )
 
 type hchan struct {
-	qcount   uint           // total data in the queue
-	dataqsiz uint           // size of the circular queue
-	buf      unsafe.Pointer // points to an array of dataqsiz elements
-	elemsize uint16
-	closed   uint32
-	elemtype *_type // element type
-	sendx    uint   // send index
-	recvx    uint   // receive index
-	recvq    waitq  // list of recv waiters
-	sendq    waitq  // list of send waiters
+	// 如果 qcount 和 dataqsiz 的值相同，则表示缓冲区用完了。
+	qcount   uint           // total data in the queue						buffer 中已放入的元素个数
+	dataqsiz uint           // size of the circular queue					用户构造 channel 时指定的 buf 大小
+	buf      unsafe.Pointer // points to an array of dataqsiz elements		环形缓冲区
+
+	elemsize uint16															// buffer 中每个元素的大小
+	closed   uint32															// channel 是否关闭，== 0 代表未 closed
+	elemtype *_type // element type											// channel 元素的类型信息
+
+	sendx    uint   // send index											buffer 中已发送的索引位置 send index
+	recvx    uint   // receive index										buffer 中已接收的索引位置 receive index
+	recvq    waitq  // list of recv waiters									等待接收的 goroutine
+	sendq    waitq  // list of send waiters									等待发送的 goroutine
 
 	// lock protects all fields in hchan, as well as several
 	// fields in sudogs blocked on this channel.
@@ -91,16 +94,19 @@ func makechan(t *chantype, size int) *hchan {
 	var c *hchan
 	switch {
 	case mem == 0:
+		// 1. 无缓冲
 		// Queue or element size is zero.
 		c = (*hchan)(mallocgc(hchanSize, nil, true))
 		// Race detector uses this location for synchronization.
 		c.buf = c.raceaddr()
 	case elem.ptrdata == 0:
+		// 2. 有缓冲，不包含指针
 		// Elements do not contain pointers.
 		// Allocate hchan and buf in one call.
 		c = (*hchan)(mallocgc(hchanSize+mem, nil, true))
 		c.buf = add(unsafe.Pointer(c), hchanSize)
 	default:
+		// 3. 有缓冲，包含指针
 		// Elements contain pointers.
 		c = new(hchan)
 		c.buf = mallocgc(mem, elem, true)
@@ -155,6 +161,12 @@ func chansend1(c *hchan, elem unsafe.Pointer) {
  * been closed.  it is easiest to loop and re-run
  * the operation; we'll see that it's now closed.
  */
+// channel 发送数据
+// 参数 c 表示要向哪个 chan 发送数据，
+// ep 表示要发送的数据的地址，
+// block 表示是否需要阻塞，
+// callerpc 表示调用地址。
+// 返回值 bool 表示数据是否成功发送。
 func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 	if c == nil {
 		if !block {
@@ -197,6 +209,7 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 		t0 = cputicks()
 	}
 
+	// 1. 通道加锁
 	lock(&c.lock)
 
 	if c.closed != 0 {
@@ -204,6 +217,8 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 		panic(plainError("send on closed channel"))
 	}
 
+	// 2. 发送数据
+	// 2.1 如果此时 recvq 不为空，说明有G在阻塞等待，则调用 send 函数将数据拷贝到对应的 G 的堆栈上，然后将其唤醒。
 	if sg := c.recvq.dequeue(); sg != nil {
 		// Found a waiting receiver. We pass the value we want to send
 		// directly to the receiver, bypassing the channel buffer (if any).
@@ -211,30 +226,40 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 		return true
 	}
 
+	// 2.2 如果缓冲区没满，channel 会尝试把数据放到缓存中。
 	if c.qcount < c.dataqsiz {
 		// Space is available in the channel buffer. Enqueue the element to send.
+
+		// chanbuf 函数从 buf 中取出第 i 个元素的存放地址：相当于 c.buf[c.sendx]
 		qp := chanbuf(c, c.sendx)
 		if raceenabled {
 			raceacquire(qp)
 			racerelease(qp)
 		}
+		// 将数据拷贝到 buffer 中
 		typedmemmove(c.elemtype, qp, ep)
+		// 写入的index + 1
 		c.sendx++
 		if c.sendx == c.dataqsiz {
 			c.sendx = 0
 		}
+		// buffer中的元素总数+1
 		c.qcount++
 		unlock(&c.lock)
 		return true
 	}
 
+	// 非阻塞，这里直接返回
 	if !block {
 		unlock(&c.lock)
 		return false
 	}
 
+	// 2.3 如果没有缓冲区，或者缓冲区已满。此时会将当前的 goroutine 以及要发送的数据放入到 sendq 队列中，同时会切出该 goroutine。
 	// Block on the channel. Some receiver will complete our operation for us.
+	// 获取当前G
 	gp := getg()
+	// acquireSudog 申请一个 sudog 对象。
 	mysg := acquireSudog()
 	mysg.releasetime = 0
 	if t0 != 0 {
@@ -249,7 +274,9 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
 	mysg.c = c
 	gp.waiting = mysg
 	gp.param = nil
+	// 封装好的当前G放到发送等待列队
 	c.sendq.enqueue(mysg)
+	// goparkunlock 就是解锁传入的 mutex，并切出该 goroutine，将该 goroutine 置为 waiting 状态。
 	gopark(chanparkcommit, unsafe.Pointer(&c.lock), waitReasonChanSend, traceEvGoBlockSend, 2)
 	// Ensure the value being sent is kept alive until the
 	// receiver copies it out. The sudog has a pointer to the
@@ -305,6 +332,7 @@ func send(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
 		}
 	}
 	if sg.elem != nil {
+		// 1. memmove(dst, src, t.size) 进行数据的转移，本质上就是一个内存拷贝。
 		sendDirect(c.elemtype, sg, ep)
 		sg.elem = nil
 	}
@@ -314,6 +342,7 @@ func send(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
 	if sg.releasetime != 0 {
 		sg.releasetime = cputicks()
 	}
+	// 2. goready(gp, skip+1) goready 的作用是唤醒对应的 goroutine。
 	goready(gp, skip+1)
 }
 
@@ -354,6 +383,7 @@ func closechan(c *hchan) {
 		panic(plainError("close of nil channel"))
 	}
 
+	// 1. 加锁
 	lock(&c.lock)
 	if c.closed != 0 {
 		unlock(&c.lock)
@@ -366,12 +396,14 @@ func closechan(c *hchan) {
 		racerelease(c.raceaddr())
 	}
 
+	// 2. 将锁标志置为1
 	c.closed = 1
 
 	var glist gList
 
 	// release all readers
 	for {
+		// 3. 唤醒所有的接收者，并且将接收数据置为 0 值。
 		sg := c.recvq.dequeue()
 		if sg == nil {
 			break
@@ -393,6 +425,7 @@ func closechan(c *hchan) {
 
 	// release all writers (they will panic)
 	for {
+		// 4. 唤醒所有发送者，令其 panic。
 		sg := c.sendq.dequeue()
 		if sg == nil {
 			break
@@ -446,6 +479,9 @@ func chanrecv2(c *hchan, elem unsafe.Pointer) (received bool) {
 // Otherwise, if c is closed, zeros *ep and returns (true, false).
 // Otherwise, fills in *ep with an element and returns (true, true).
 // A non-nil ep must point to the heap or the caller's stack.
+// channel 接收数据
+// chanrecv 从 c 中接收数据，并且将接收到的数据存到 ep 中，block 表示是否需要阻塞。
+// 如果没有数据可以接收，而且是非阻塞的情况，则返回 (false,flase)。如果 c 已经关闭了，将 ep 指向的值置为 0值，并且返回 (true, false)。其它情况返回值为 (true,true)，表示成功从 c 中获取到了数据。
 func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool) {
 	// raceenabled: don't need to check ep, as it is always on the stack
 	// or is new memory allocated by reflect.
