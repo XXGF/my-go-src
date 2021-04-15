@@ -32,10 +32,10 @@ type WaitGroup struct {
 func (wg *WaitGroup) state() (statep *uint64, semap *uint32) {
 	// 判断是否是8字节对齐
 	if uintptr(unsafe.Pointer(&wg.state1))%8 == 0 {
-		// 8字节对齐，前8个字节存state，后4个字节存sema
+		// 8字节对齐【不是8字节对齐，而是offset对8取模是0】，前8个字节存state，后4个字节存sema
 		return (*uint64)(unsafe.Pointer(&wg.state1)), &wg.state1[2]
 	} else {
-		// 4字节对齐：后8字节作为state，前4个字节存sema
+		// 4字节对齐【不是4字节对齐，而是offset对8取模是4，那么4+4==8，则statep所在的offset就是8字节对齐的】：后8字节作为state，前4个字节存sema
 		return (*uint64)(unsafe.Pointer(&wg.state1[1])), &wg.state1[0]
 	}
 	// 这样做的目的是，保证原子操作的state1在32位系统上，也是8字节对齐
